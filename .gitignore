@@ -1,0 +1,25 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Database
+*.db
+
+# Reports & exports (large binary files)
+reports/
+export/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

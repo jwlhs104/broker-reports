@@ -1,0 +1,12 @@
+paths:
+  reports_dir: "./reports"
+  db_url: "sqlite:///reports.db"
+
+llm:
+  provider: "openai"          # "claude" 或 "openai"
+  claude_model: "claude-sonnet-4-20250514"
+  openai_model: "gpt-4o"
+
+extraction:
+  max_pages: 10          # 擷取前 N 頁送 LLM
+  batch_size: 5          # 每批處理幾份報告
