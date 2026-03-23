@@ -41,7 +41,7 @@ def _format_results(results: list, title: str = "") -> str:
     for i, r in enumerate(results, 1):
         tp = f"目標價 {r.target_price}" if r.target_price else "無目標價"
         lines.append(
-            f"{i}. [{r.stock_code or '?'}] {r.stock_name or '?'} | "
+            f"{i}. [ID:{r.id}] [{r.stock_code or '?'}] {r.stock_name or '?'} | "
             f"{r.report_date} | {r.broker or '?'} | "
             f"{r.rating or '未評等'} | {tp}"
         )
@@ -123,11 +123,12 @@ def search_broker_reports(
 
 @mcp.tool()
 def get_report_detail(report_id: int) -> str:
-    """取得單份報告的完整結構化資訊，包含摘要、投資邏輯、主題標籤等。
+    """取得單份報告的完整資訊，包含結構化摘要與原始 PDF 全文。
 
     Args:
         report_id: 報告 ID (從 search_broker_reports 結果取得)
     """
+    import os
     from src.database import get_session
     from src.models import Report
 
@@ -145,6 +146,7 @@ def get_report_detail(report_id: int) -> str:
         f"產業: {data['industry']}",
         f"評等: {data['rating']} | 目標價: {data['target_price']} | 現價: {data['current_price']}",
         f"品質: {data['quality_score']}/10",
+        f"檔案: {report.filename}",
         "",
         f"📝 摘要:\n{data['summary']}",
         "",
@@ -152,6 +154,29 @@ def get_report_detail(report_id: int) -> str:
         "",
         f"🏷️ 主題: {', '.join(data['topics'])}",
     ]
+
+    # 嘗試取得原始全文
+    full_text = None
+
+    # 優先使用 DB 中已存的 raw_text
+    if report.raw_text:
+        full_text = report.raw_text
+    else:
+        # 嘗試從原始 PDF 讀取
+        file_path = report.file_path
+        if file_path and os.path.exists(file_path):
+            try:
+                from src.pdf_parser import extract_text
+                full_text, _ = extract_text(file_path)
+            except Exception as e:
+                lines.append(f"\n⚠️ 無法讀取原始 PDF: {e}")
+
+    if full_text:
+        lines.append("\n" + "=" * 60)
+        lines.append("📖 原始報告全文:")
+        lines.append("=" * 60)
+        lines.append(full_text)
+
     return "\n".join(lines)
 
 
@@ -273,3 +298,21 @@ def get_stats() -> str:
         lines.append(f"  {rating}: {cnt} 份")
 
     return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="券商報告 MCP Server")
+    parser.add_argument(
+        "--transport", choices=["stdio", "http"], default="stdio",
+        help="傳輸模式: stdio (本地, 預設) 或 http (網路服務)",
+    )
+    parser.add_argument("--host", default="0.0.0.0", help="HTTP 綁定位址 (預設 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=8100, help="HTTP 埠號 (預設 8100)")
+    args = parser.parse_args()
+
+    if args.transport == "http":
+        mcp.run(transport="streamable-http", host=args.host, port=args.port)
+    else:
+        mcp.run(transport="stdio")
