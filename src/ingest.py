@@ -1,18 +1,19 @@
 """報告匯入流程：掃描 → 解析檔名 → 擷取文字 → LLM 結構化 → 建立 FTS 索引"""
+
 import json
-import os
 from datetime import date
 from pathlib import Path
+
 from rich.console import Console
 from rich.progress import track
 from sqlalchemy import text
 
 from src.config import CONFIG
-from src.database import init_db, get_session, engine
-from src.models import Report, FTS_TABLE_NAME, REBUILD_FTS_ENTRY
-from src.filename_parser import parse_filename
-from src.pdf_parser import extract_text
+from src.database import engine, get_session, init_db
 from src.extractor import extract_report_data
+from src.filename_parser import parse_filename
+from src.models import REBUILD_FTS_ENTRY, Report
+from src.pdf_parser import extract_text
 
 console = Console()
 
@@ -22,7 +23,7 @@ def scan_and_register():
     init_db()
     session = get_session()
     reports_dir = CONFIG["paths"]["reports_dir"]
-    pdf_files = list(Path(reports_dir).glob("*.pdf"))
+    pdf_files = list(Path(reports_dir).glob("*.pdf")) + list(Path(reports_dir).glob("*.docx"))
 
     new_count = 0
     for pdf_path in pdf_files:
@@ -33,7 +34,7 @@ def scan_and_register():
         meta = parse_filename(str(pdf_path))
         report = Report(
             stock_code=meta.stock_code,  # 檔名初步解析，LLM 擷取後會覆蓋
-            broker=meta.broker,          # 檔名初步解析，LLM 擷取後會覆蓋
+            broker=meta.broker,  # 檔名初步解析，LLM 擷取後會覆蓋
             report_date=meta.report_date,
             filename=meta.filename,
             file_path=str(pdf_path),
@@ -44,22 +45,25 @@ def scan_and_register():
 
     session.commit()
     session.close()
-    console.print(f"[green]掃描完成: 發現 {len(pdf_files)} 份 PDF, 新增 {new_count} 份到資料庫[/green]")
+    console.print(f"[green]掃描完成: 發現 {len(pdf_files)} 份文件 (PDF/DOCX), 新增 {new_count} 份到資料庫[/green]")
     return new_count
 
 
 def _update_fts(report: Report):
     """將報告資料寫入 FTS5 索引"""
     with engine.connect() as conn:
-        conn.execute(text(REBUILD_FTS_ENTRY), {
-            "rowid": report.id,
-            "report_id": report.id,
-            "stock_name": report.stock_name or "",
-            "summary": report.summary or "",
-            "investment_thesis": report.investment_thesis or "",
-            "topics": report.topics or "",
-            "raw_text": report.raw_text or "",
-        })
+        conn.execute(
+            text(REBUILD_FTS_ENTRY),
+            {
+                "rowid": report.id,
+                "report_id": report.id,
+                "stock_name": report.stock_name or "",
+                "summary": report.summary or "",
+                "investment_thesis": report.investment_thesis or "",
+                "topics": report.topics or "",
+                "raw_text": report.raw_text or "",
+            },
+        )
         conn.commit()
 
 

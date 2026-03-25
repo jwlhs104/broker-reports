@@ -1,8 +1,20 @@
-"""使用 Claude Agent SDK 從報告文字中擷取結構化資訊"""
+"""使用 Claude Agent SDK 從報告文字中擷取結構化資訊
+
+巢狀問題處理：
+本模組可能在 Claude Code session 內被呼叫（如 ccbot agent 觸發 ingest）。
+claude_agent_sdk 不支援巢狀 session，因此需清除 CLAUDECODE 環境變數。
+為避免污染父進程，ingest_all.py 會在獨立子進程中執行。
+"""
 import json
 import asyncio
 import logging
+import os
 from typing import Optional
+
+# 清除巢狀標記 — 讓 Agent SDK 認為自己是獨立 session
+# 這在子進程中是安全的（不影響父進程的 ccbot Agent SDK session）
+for _env_key in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"):
+    os.environ.pop(_env_key, None)
 
 from claude_agent_sdk import (
     query,
@@ -108,12 +120,19 @@ async def _extract_async(text: str) -> dict:
     # 嘗試清理 markdown code block 包裹
     if raw.startswith("```"):
         lines = raw.split("\n")
-        # 移除首行 ```json 和末行 ```
         lines = [l for l in lines if not l.strip().startswith("```")]
         raw = "\n".join(lines).strip()
 
+    # 找到第一個 '{' 開始的 JSON 物件，用 raw_decode 只解析第一個完整物件
+    start = raw.find("{")
+    if start == -1:
+        logger.error("找不到 JSON 物件，原始回傳:\n%s", raw[:500])
+        raise ValueError("Claude 回傳中找不到 JSON 物件")
+
+    decoder = json.JSONDecoder()
     try:
-        return json.loads(raw)
+        result, _ = decoder.raw_decode(raw, start)
+        return result
     except json.JSONDecodeError as e:
         logger.error("JSON 解析失敗，原始回傳:\n%s", raw[:500])
         raise ValueError(f"Claude 回傳的 JSON 無法解析: {e}") from e

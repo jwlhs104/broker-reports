@@ -9,7 +9,9 @@ init_db()
 
 mcp = FastMCP(
     "broker-reports",
-    instructions="台灣券商研究報告查詢系統。可搜尋 8000+ 份券商報告的評等、目標價、產業分析、投資邏輯等結構化資訊。"
+    instructions="台灣券商研究報告查詢系統。可搜尋 8000+ 份券商報告的評等、目標價、產業分析、投資邏輯等結構化資訊。",
+    host="0.0.0.0",
+    port=8100,
 )
 
 
@@ -313,6 +315,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.transport == "http":
-        mcp.run(transport="streamable-http", host=args.host, port=args.port)
+        mcp.settings.host = args.host
+        mcp.settings.port = args.port
+        mcp.run(transport="streamable-http")
     else:
         mcp.run(transport="stdio")

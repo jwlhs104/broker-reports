@@ -8,3 +8,8 @@ llm:
 extraction:
   max_pages: 10          # 擷取前 N 頁送 LLM
   batch_size: 5          # 每批處理幾份報告
+
+# tg-archiver 同步設定
+tg_archiver:
+  db_path: "/Users/jimquant/Desktop/workspace/tg-archiver/data/archiver.db"
+  media_dir: "/Users/jimquant/Desktop/workspace/tg-archiver/data/media"

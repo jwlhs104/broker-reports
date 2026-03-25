@@ -9,6 +9,13 @@ import argparse
 import sys
 import os
 
+# 清除巢狀 Claude Code 標記 —
+# 當此腳本從 ccbot Agent SDK session 內被呼叫時（如東尼跑 Bash），
+# 子進程會繼承 CLAUDECODE 環境變數，導致 Agent SDK 拒絕啟動。
+# 在子進程中清除是安全的，不影響父進程。
+for _key in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"):
+    os.environ.pop(_key, None)
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.ingest import ingest_all
 
