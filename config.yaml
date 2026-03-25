@@ -9,7 +9,9 @@ extraction:
   max_pages: 10          # 擷取前 N 頁送 LLM
   batch_size: 5          # 每批處理幾份報告
 
-# tg-archiver 同步設定
+# tg-archiver 同步與監控設定
 tg_archiver:
   db_path: "/Users/jimquant/Desktop/workspace/tg-archiver/data/archiver.db"
   media_dir: "/Users/jimquant/Desktop/workspace/tg-archiver/data/media"
+  bot_token: ""    # ← 填入你的 Telegram Bot Token
+  notify_chat_id: 0    # ← 填入你的 Telegram User ID (用 @userinfobot 查詢)
