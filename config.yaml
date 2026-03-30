@@ -9,6 +9,16 @@ extraction:
   max_pages: 10          # 擷取前 N 頁送 LLM
   batch_size: 5          # 每批處理幾份報告
 
+# Dropbox 同步設定
+dropbox:
+  remote: "dropbox"                # rclone remote 名稱
+  remote_path: "/券商報告"           # Dropbox 上的資料夾路徑
+  # 排除的檔案模式 (rclone --exclude)
+  excludes:
+    - "*.tmp"
+    - ".DS_Store"
+    - "~$*"                        # Office 暫存檔
+
 # tg-archiver 同步與監控設定
 tg_archiver:
   db_path: "/Users/jimquant/Desktop/workspace/tg-archiver/data/archiver.db"

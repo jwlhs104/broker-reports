@@ -1,9 +1,11 @@
 """券商報告 MCP Server — 查詢專用"""
+
 from datetime import date
-from typing import Optional
+
 from mcp.server.fastmcp import FastMCP
+
 from src.database import init_db
-from src.search import search_reports, search_by_mentioned_stock, fulltext_search, smart_search
+from src.search import search_by_mentioned_stock, search_reports, smart_search
 
 init_db()
 
@@ -56,14 +58,14 @@ def _format_results(results: list, title: str = "") -> str:
 
 @mcp.tool()
 def search_broker_reports(
-    query: Optional[str] = None,
-    stock_code: Optional[str] = None,
-    broker: Optional[str] = None,
-    industry: Optional[str] = None,
-    topic: Optional[str] = None,
-    rating: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
+    query: str | None = None,
+    stock_code: str | None = None,
+    broker: str | None = None,
+    industry: str | None = None,
+    topic: str | None = None,
+    rating: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
     limit: int = 20,
 ) -> str:
     """搜尋券商研究報告。
@@ -131,6 +133,7 @@ def get_report_detail(report_id: int) -> str:
         report_id: 報告 ID (從 search_broker_reports 結果取得)
     """
     import os
+
     from src.database import get_session
     from src.models import Report
 
@@ -149,6 +152,7 @@ def get_report_detail(report_id: int) -> str:
         f"評等: {data['rating']} | 目標價: {data['target_price']} | 現價: {data['current_price']}",
         f"品質: {data['quality_score']}/10",
         f"檔案: {report.filename}",
+        f"路徑: {report.file_path}",
         "",
         f"📝 摘要:\n{data['summary']}",
         "",
@@ -169,6 +173,7 @@ def get_report_detail(report_id: int) -> str:
         if file_path and os.path.exists(file_path):
             try:
                 from src.pdf_parser import extract_text
+
                 full_text, _ = extract_text(file_path)
             except Exception as e:
                 lines.append(f"\n⚠️ 無法讀取原始 PDF: {e}")
@@ -203,12 +208,14 @@ def compare_target_prices(stock_code: str) -> str:
     stock_name = results[0].stock_name or stock_code
     lines = [
         f"📊 {stock_code} {stock_name} — 各券商最新觀點 ({len(latest_by_broker)} 家)",
-        ""
+        "",
     ]
 
     for broker, r in sorted(latest_by_broker.items()):
         tp = f"目標價 {r.target_price}" if r.target_price else "無目標價"
-        lines.append(f"  {broker:　<6} | {r.rating or '未評等':　<3} | {tp} | {r.report_date}")
+        lines.append(
+            f"  {broker:　<6} | {r.rating or '未評等':　<3} | {tp} | {r.report_date}"
+        )
         if r.investment_thesis:
             lines.append(f"  {'':　<6}   💡 {r.investment_thesis}")
         lines.append("")
@@ -216,13 +223,18 @@ def compare_target_prices(stock_code: str) -> str:
     # 統計
     prices = [r.target_price for r in latest_by_broker.values() if r.target_price]
     if prices:
-        lines.append(f"目標價範圍: {min(prices):.1f} ~ {max(prices):.1f} (均值 {sum(prices)/len(prices):.1f})")
+        lines.append(
+            f"目標價範圍: {min(prices):.1f} ~ {max(prices):.1f} (均值 {sum(prices) / len(prices):.1f})"
+        )
 
     ratings = [r.rating for r in latest_by_broker.values() if r.rating]
     if ratings:
         from collections import Counter
+
         rc = Counter(ratings)
-        lines.append(f"評等分佈: {', '.join(f'{k} {v}家' for k, v in rc.most_common())}")
+        lines.append(
+            f"評等分佈: {', '.join(f'{k} {v}家' for k, v in rc.most_common())}"
+        )
 
     return "\n".join(lines)
 
@@ -244,13 +256,26 @@ def find_related_reports(stock_code: str, limit: int = 20) -> str:
 def get_stats() -> str:
     """取得報告資料庫的統計概覽：總數、產業分佈、券商分佈、評等分佈等。"""
     from sqlalchemy import func
+
     from src.database import get_session
     from src.models import Report
 
     session = get_session()
-    total = session.query(func.count(Report.id)).filter_by(extraction_status="done").scalar()
-    pending = session.query(func.count(Report.id)).filter_by(extraction_status="pending").scalar()
-    failed = session.query(func.count(Report.id)).filter_by(extraction_status="failed").scalar()
+    total = (
+        session.query(func.count(Report.id))
+        .filter_by(extraction_status="done")
+        .scalar()
+    )
+    pending = (
+        session.query(func.count(Report.id))
+        .filter_by(extraction_status="pending")
+        .scalar()
+    )
+    failed = (
+        session.query(func.count(Report.id))
+        .filter_by(extraction_status="failed")
+        .scalar()
+    )
 
     # 產業 top 10
     industry_counts = (
@@ -283,7 +308,7 @@ def get_stats() -> str:
     session.close()
 
     lines = [
-        f"📊 報告資料庫統計",
+        "📊 報告資料庫統計",
         f"已完成: {total} | 待處理: {pending} | 失敗: {failed}",
         "",
         "🏭 產業 Top 10:",
@@ -307,10 +332,14 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="券商報告 MCP Server")
     parser.add_argument(
-        "--transport", choices=["stdio", "http"], default="stdio",
+        "--transport",
+        choices=["stdio", "http"],
+        default="stdio",
         help="傳輸模式: stdio (本地, 預設) 或 http (網路服務)",
     )
-    parser.add_argument("--host", default="0.0.0.0", help="HTTP 綁定位址 (預設 0.0.0.0)")
+    parser.add_argument(
+        "--host", default="0.0.0.0", help="HTTP 綁定位址 (預設 0.0.0.0)"
+    )
     parser.add_argument("--port", type=int, default=8100, help="HTTP 埠號 (預設 8100)")
     args = parser.parse_args()
 
