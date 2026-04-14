@@ -18,6 +18,9 @@ venv/
 reports/
 export/
 
+# Logs
+*.log
+
 # IDE
 .vscode/
 .idea/
