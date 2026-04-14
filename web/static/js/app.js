@@ -424,7 +424,6 @@ async function sendMessage() {
     if (sendConv) {
         if (!sendConv.messages) sendConv.messages = [];
         sendConv.messages.push({ role: "user", content: question });
-        // 立即更新標題（若是第一輪）
         if (sendConv.title === "新對話") {
             sendConv.title = question.length > 30 ? question.slice(0, 30) + "…" : question;
         }
@@ -433,14 +432,30 @@ async function sendMessage() {
         renderConversationList();
     }
 
-    const loadingEl = appendMessage("assistant", `
-        <div class="typing-indicator">
-            <span></span><span></span><span></span>
-        </div>
-    `);
+    // 建立 assistant 訊息容器（用於串流填充）
+    const msgEl = document.createElement("div");
+    msgEl.className = "message assistant";
+    const contentEl = document.createElement("div");
+    contentEl.className = "message-content";
+    contentEl.innerHTML = `<div class="stream-status" style="color:var(--text-muted);font-size:13px;display:flex;align-items:center;gap:8px">
+        <div class="typing-indicator" style="display:inline-flex"><span></span><span></span><span></span></div>
+        <span>正在分析問題...</span>
+    </div>
+    <div class="stream-text"></div>`;
+    msgEl.appendChild(contentEl);
+    $messages.appendChild(msgEl);
+    $messages.scrollTop = $messages.scrollHeight;
+
+    const statusEl = contentEl.querySelector(".stream-status");
+    const textEl = contentEl.querySelector(".stream-text");
+    const msgIdx = messageIndex;
+    messageIndex++;
+
+    let rawAnswer = "";
+    let sources = [];
 
     try {
-        const res = await fetch("/api/chat", {
+        const res = await fetch("/api/chat/stream", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -449,39 +464,101 @@ async function sendMessage() {
                 history: historySnapshot,
             }),
         });
-        const data = await res.json();
 
-        // ★ 回覆存到發送時的對話（即使使用者已切走）
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let sseBuffer = "";
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            sseBuffer += decoder.decode(value, { stream: true });
+
+            // 解析 SSE events（以 \n\n 分隔）
+            const events = sseBuffer.split("\n\n");
+            sseBuffer = events.pop(); // 最後一段可能不完整，保留
+
+            for (const eventBlock of events) {
+                if (!eventBlock.trim()) continue;
+
+                let eventType = "";
+                let eventData = "";
+
+                for (const line of eventBlock.split("\n")) {
+                    if (line.startsWith("event: ")) {
+                        eventType = line.slice(7);
+                    } else if (line.startsWith("data: ")) {
+                        eventData += (eventData ? "\n" : "") + line.slice(6);
+                    }
+                }
+
+                switch (eventType) {
+                    case "status":
+                        if (eventData) {
+                            statusEl.querySelector("span:last-child").textContent = eventData;
+                            statusEl.style.display = "flex";
+                        } else {
+                            statusEl.style.display = "none";
+                        }
+                        break;
+
+                    case "sources_preview":
+                        // 提前收到報告 metadata
+                        try {
+                            sources = JSON.parse(eventData);
+                            currentSources[msgIdx] = sources;
+                        } catch {}
+                        break;
+
+                    case "chunk":
+                        rawAnswer += eventData;
+                        // 即時渲染 markdown（每個 chunk 都重新 parse 整段）
+                        if (activeConvId === sendConvId) {
+                            textEl.innerHTML = processSourceRefs(rawAnswer, msgIdx);
+                            $messages.scrollTop = $messages.scrollHeight;
+                        }
+                        break;
+
+                    case "sources":
+                        // 最終精確的 sources（含 excerpt）
+                        try {
+                            sources = JSON.parse(eventData);
+                            currentSources[msgIdx] = sources;
+                        } catch {}
+                        break;
+
+                    case "done":
+                        break;
+                }
+            }
+        }
+
+        // ── 串流結束：最終渲染 ──
+        statusEl.remove();
+
+        // ★ 存到正確的對話
         const targetConv = getConv(sendConvId);
         if (targetConv) {
             if (!targetConv.messages) targetConv.messages = [];
             targetConv.messages.push({
                 role: "assistant",
-                content: data.answer,
-                sources: trimSources(data.sources || []),
+                content: rawAnswer,
+                sources: trimSources(sources),
             });
-            // 更新 preview
-            const plain = (data.answer || "").replace(/[#*_`>\[\]]/g, "").trim();
+            const plain = rawAnswer.replace(/[#*_`>\[\]]/g, "").trim();
             targetConv.preview = plain.length > 60 ? plain.slice(0, 60) + "…" : plain;
             targetConv.updatedAt = Date.now();
-            // 移到最前面
             conversations = conversations.filter(c => c.id !== targetConv.id);
             conversations.unshift(targetConv);
             saveConversations();
-            console.log(`[ANALYST] Saved assistant reply to conv ${sendConvId}, total: ${targetConv.messages.length} msgs`);
         }
 
-        // ★ 只有還在同一對話時才更新 UI
         if (activeConvId === sendConvId) {
-            loadingEl.remove();
+            // 最終重新渲染（確保 markdown 完整 parse）
+            textEl.innerHTML = processSourceRefs(rawAnswer, msgIdx);
 
-            const msgIdx = messageIndex;
-            const sources = data.sources || [];
-            currentSources[msgIdx] = sources;
-
-            const processedAnswer = processSourceRefs(data.answer, msgIdx);
-            const msgEl = appendMessage("assistant", processedAnswer);
-
+            // 渲染 source chips
             if (sources.length > 0) {
                 const sourcesBar = document.createElement("div");
                 sourcesBar.className = "sources-bar";
@@ -494,23 +571,22 @@ async function sendMessage() {
                         ${escapeHtml(s.broker)} ${escapeHtml(s.date)}
                     </span>
                 `).join("");
-                msgEl.querySelector(".message-content").appendChild(sourcesBar);
+                contentEl.appendChild(sourcesBar);
             }
 
-            chatHistory.push({ role: "assistant", content: data.answer });
+            chatHistory.push({ role: "assistant", content: rawAnswer });
             renderConversationList();
+            $messages.scrollTop = $messages.scrollHeight;
         } else {
-            // 已切走 → 只更新側邊欄，不動 UI
-            console.log(`[ANALYST] User switched away from ${sendConvId}, reply saved silently`);
             renderConversationList();
         }
 
     } catch (e) {
+        statusEl?.remove();
         if (activeConvId === sendConvId) {
-            loadingEl.remove();
-            appendMessage("assistant", "抱歉，發生錯誤。請稍後再試。");
+            textEl.innerHTML = "抱歉，發生錯誤。請稍後再試。";
         }
-        console.error("[ANALYST] sendMessage error:", e);
+        console.error("[ANALYST] sendMessage stream error:", e);
     }
 
     $sendBtn.disabled = false;

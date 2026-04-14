@@ -70,7 +70,16 @@ if LLM_BACKEND == "openai":
     MODEL = os.environ.get("LLM_MODEL", "anthropic/claude-sonnet-4")
 
 
-async def call_llm(system_prompt: str, messages: list[dict]) -> str:
+def _build_cli_prompt(system_prompt: str, messages: list[dict]) -> str:
+    """把 system prompt + 對話歷史組合成 claude CLI 用的 prompt。"""
+    conv_parts = [system_prompt, ""]
+    for m in messages:
+        role_label = "使用者" if m["role"] == "user" else "助手"
+        conv_parts.append(f"[{role_label}]\n{m['content']}")
+    return "\n\n".join(conv_parts)
+
+
+async def call_llm(system_prompt: str, messages: list[dict], model: str = "sonnet") -> str:
     """統一 LLM 呼叫介面"""
     if LLM_BACKEND == "openai" and llm:
         full_messages = [{"role": "system", "content": system_prompt}] + messages
@@ -81,21 +90,15 @@ async def call_llm(system_prompt: str, messages: list[dict]) -> str:
         )
         return response.choices[0].message.content
     else:
-        # Claude CLI 模式：用訂閱制，透過 subprocess 呼叫
-        # 把 system prompt + 完整對話歷史組合成一個 prompt
-        conv_parts = [system_prompt, ""]
-        for m in messages:
-            role_label = "使用者" if m["role"] == "user" else "助手"
-            conv_parts.append(f"[{role_label}]\n{m['content']}")
-        full_prompt = "\n\n".join(conv_parts)
-
-        # claude -p "prompt" --model sonnet 直接輸出結果
+        full_prompt = _build_cli_prompt(system_prompt, messages)
         proc = await asyncio.create_subprocess_exec(
             "claude",
             "-p",
             full_prompt,
             "--model",
-            "sonnet",
+            model,
+            "--allowedTools",
+            "",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={**os.environ, "NO_COLOR": "1"},
@@ -108,6 +111,65 @@ async def call_llm(system_prompt: str, messages: list[dict]) -> str:
             raise RuntimeError(f"Claude CLI failed: {err}")
 
         return stdout.decode().strip()
+
+
+async def call_llm_stream(system_prompt: str, messages: list[dict], model: str = "sonnet") -> AsyncGenerator[str, None]:
+    """串流版 LLM 呼叫，逐 chunk yield 文字。"""
+    if LLM_BACKEND == "openai" and llm:
+        full_messages = [{"role": "system", "content": system_prompt}] + messages
+        stream = llm.chat.completions.create(
+            model=MODEL,
+            max_tokens=4096,
+            messages=full_messages,
+            stream=True,
+        )
+        for chunk in stream:
+            delta = chunk.choices[0].delta
+            if delta.content:
+                yield delta.content
+    else:
+        full_prompt = _build_cli_prompt(system_prompt, messages)
+
+        proc = await asyncio.create_subprocess_exec(
+            "claude",
+            "-p",
+            full_prompt,
+            "--model",
+            model,
+            "--allowedTools",
+            "",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "NO_COLOR": "1"},
+        )
+
+        async for line in proc.stdout:
+            text = line.decode().strip()
+            if not text:
+                continue
+            try:
+                event = json.loads(text)
+                etype = event.get("type", "")
+
+                # 串流 delta: text_delta
+                if etype == "stream_event":
+                    inner = event.get("event", {})
+                    delta = inner.get("delta", {})
+                    if delta.get("type") == "text_delta" and "text" in delta:
+                        yield delta["text"]
+
+                # 完整結果 fallback
+                elif etype == "result" and event.get("result"):
+                    yield event["result"]
+
+            except json.JSONDecodeError:
+                continue
+
+        await proc.wait()
 
 
 # ── Pydantic models ──
@@ -407,7 +469,7 @@ async def extract_search_intent(question: str, history: list[dict]) -> dict:
     conv_messages.append({"role": "user", "content": question})
 
     try:
-        raw = await call_llm(intent_prompt, conv_messages)
+        raw = await call_llm(intent_prompt, conv_messages, model="haiku")
         # 清理：移除 markdown code block 標記
         cleaned = raw.strip()
         if cleaned.startswith("```"):
@@ -610,6 +672,211 @@ async def api_chat(req: ChatRequest):
                 )
 
     return ChatResponse(answer=answer_text, sources=sources)
+
+
+# ══════════════════════════════════════════════════════════
+#  SSE Streaming endpoint
+# ══════════════════════════════════════════════════════════
+from starlette.responses import StreamingResponse
+
+
+def _build_sources_from_reports(
+    reports: list[Report], answer_text: str, source_data: list[dict] | None = None
+) -> list[dict]:
+    """從報告 metadata 和（可選的）LLM source_data 建立 sources 列表。"""
+    sources = []
+    if source_data:
+        for s in source_data:
+            src_id = s.get("id", 0)
+            report_id = s.get("report_id", 0)
+            matched = next((r for r in reports if r.id == report_id), None)
+            if not matched and 1 <= src_id <= len(reports):
+                matched = reports[src_id - 1]
+            if matched:
+                sources.append(
+                    {
+                        "id": src_id,
+                        "report_id": matched.id,
+                        "broker": matched.broker or "",
+                        "date": matched.report_date.isoformat() if matched.report_date else "",
+                        "stock_code": matched.stock_code or "",
+                        "stock_name": matched.stock_name or "",
+                        "rating": matched.rating,
+                        "target_price": matched.target_price,
+                        "summary": matched.summary or "",
+                        "excerpt": s.get("excerpt", ""),
+                    }
+                )
+    if not sources:
+        for i, r in enumerate(reports, 1):
+            if f"[{i}]" in answer_text:
+                sources.append(
+                    {
+                        "id": i,
+                        "report_id": r.id,
+                        "broker": r.broker or "",
+                        "date": r.report_date.isoformat() if r.report_date else "",
+                        "stock_code": r.stock_code or "",
+                        "stock_name": r.stock_name or "",
+                        "rating": r.rating,
+                        "target_price": r.target_price,
+                        "summary": r.summary or "",
+                        "excerpt": r.summary or "",
+                    }
+                )
+    return sources
+
+
+def _sse_event(event: str, data: str) -> str:
+    """格式化一個 SSE event。"""
+    lines = data.replace("\n", "\ndata: ")
+    return f"event: {event}\ndata: {lines}\n\n"
+
+
+@app.post("/api/chat/stream")
+async def api_chat_stream(req: ChatRequest):
+    """SSE Streaming RAG Chat — 意圖提取 → 搜尋 → 串流回答"""
+
+    async def event_generator():
+        # ── Phase 1: 意圖提取（非串流，但發送狀態通知）──
+        yield _sse_event("status", "正在分析問題...")
+
+        intent = await extract_search_intent(req.question, req.history)
+        resolved_question = intent.get("resolved_question", req.question)
+
+        # ── Phase 2: 搜尋報告 ──
+        yield _sse_event("status", "正在搜尋相關報告...")
+
+        reports = search_by_intent(intent, req.stock_code, limit=10)
+        if not reports:
+            reports = search_for_chat(req.question, req.stock_code, limit=10)
+
+        if not reports:
+            yield _sse_event("chunk", "找不到相關的券商報告。請嘗試其他關鍵字或股票代碼。")
+            yield _sse_event("sources", "[]")
+            yield _sse_event("done", "")
+            return
+
+        reports = reports[:8]
+
+        # 先送出報告 metadata（讓前端可以提前渲染 source chips）
+        report_meta = []
+        for i, r in enumerate(reports, 1):
+            report_meta.append(
+                {
+                    "id": i,
+                    "report_id": r.id,
+                    "broker": r.broker or "",
+                    "date": r.report_date.isoformat() if r.report_date else "",
+                    "stock_code": r.stock_code or "",
+                    "stock_name": r.stock_name or "",
+                    "rating": r.rating,
+                    "target_price": r.target_price,
+                    "summary": r.summary or "",
+                    "excerpt": "",
+                }
+            )
+        yield _sse_event("sources_preview", json.dumps(report_meta, ensure_ascii=False))
+
+        # ── Phase 3: 組裝 context ──
+        context_parts = []
+        for i, r in enumerate(reports, 1):
+            raw = (r.raw_text or "")[:3000]
+            context_parts.append(
+                f"[報告 {i}] ID={r.id}\n"
+                f"券商: {r.broker} | 日期: {r.report_date} | 股票: {r.stock_code} {r.stock_name}\n"
+                f"評等: {r.rating} | 目標價: {r.target_price}\n"
+                f"摘要: {r.summary}\n"
+                f"投資邏輯: {r.investment_thesis}\n"
+                f"原文:\n{raw}\n"
+            )
+        context = "\n---\n".join(context_parts)
+
+        system_prompt = """你是專業的台股券商報告研究助手。根據提供的券商報告內容回答使用者問題。
+
+規則：
+1. 回答中每個論點必須標註來源，格式為 [n]，n 是報告編號
+2. 不同券商觀點有衝突時，並列呈現並標註各自來源
+3. 如果報告資料不足以回答，明確說明
+4. 回答使用繁體中文
+5. 回答結尾用 JSON 格式附上 sources 陣列，格式如下：
+<!--SOURCES_JSON-->
+[
+  {"id": 1, "report_id": 報告ID, "excerpt": "引用的原文段落50-150字"},
+  ...
+]
+<!--/SOURCES_JSON-->
+每個被引用的報告都要有一個 source entry，excerpt 是你引用該報告時對應的原文段落。"""
+
+        messages = []
+        for h in req.history[-6:]:
+            messages.append({"role": h["role"], "content": h["content"]})
+        messages.append(
+            {
+                "role": "user",
+                "content": f"以下是相關券商報告：\n\n{context}\n\n使用者問題：{resolved_question}",
+            }
+        )
+
+        # ── Phase 4: 串流回答 ──
+        yield _sse_event("status", "")  # 清除狀態
+
+        full_answer = []
+        buffer = ""
+        in_sources_block = False
+
+        async for chunk in call_llm_stream(system_prompt, messages):
+            buffer += chunk
+
+            # 偵測 SOURCES_JSON 開始標記
+            if "<!--SOURCES_JSON-->" in buffer and not in_sources_block:
+                # 把標記前面的文字送出
+                before = buffer.split("<!--SOURCES_JSON-->")[0]
+                if before:
+                    yield _sse_event("chunk", before)
+                    full_answer.append(before)
+                in_sources_block = True
+                buffer = buffer.split("<!--SOURCES_JSON-->", 1)[1]
+                continue
+
+            if in_sources_block:
+                # 在 sources block 裡，不送出，繼續累積
+                continue
+
+            # 正常文字 → 送出
+            yield _sse_event("chunk", buffer)
+            full_answer.append(buffer)
+            buffer = ""
+
+        # 處理剩餘 buffer
+        if not in_sources_block and buffer:
+            yield _sse_event("chunk", buffer)
+            full_answer.append(buffer)
+
+        # ── Phase 5: 解析 sources 並送出 ──
+        answer_text = "".join(full_answer).strip()
+        source_data = None
+
+        if in_sources_block:
+            json_text = buffer.split("<!--/SOURCES_JSON-->")[0].strip()
+            try:
+                source_data = json.loads(json_text)
+            except json.JSONDecodeError:
+                pass
+
+        sources = _build_sources_from_reports(reports, answer_text, source_data)
+        yield _sse_event("sources", json.dumps(sources, ensure_ascii=False))
+        yield _sse_event("done", "")
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # nginx/cloudflare 不要 buffer
+        },
+    )
 
 
 @app.get("/api/stats")
