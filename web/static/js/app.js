@@ -412,7 +412,26 @@ async function sendMessage() {
     $input.style.height = "auto";
     $sendBtn.disabled = true;
 
+    // ★ 記住發送時的對話 ID 和 history snapshot
+    const sendConvId = activeConvId;
+    const historySnapshot = chatHistory.slice(-6);
+
     appendMessage("user", escapeHtml(question));
+
+    // ★ 立即將 user 訊息存入 conv.messages + chatHistory
+    chatHistory.push({ role: "user", content: question });
+    const sendConv = getConv(sendConvId);
+    if (sendConv) {
+        if (!sendConv.messages) sendConv.messages = [];
+        sendConv.messages.push({ role: "user", content: question });
+        // 立即更新標題（若是第一輪）
+        if (sendConv.title === "新對話") {
+            sendConv.title = question.length > 30 ? question.slice(0, 30) + "…" : question;
+        }
+        sendConv.updatedAt = Date.now();
+        saveConversations();
+        renderConversationList();
+    }
 
     const loadingEl = appendMessage("assistant", `
         <div class="typing-indicator">
@@ -427,60 +446,70 @@ async function sendMessage() {
             body: JSON.stringify({
                 question,
                 stock_code: $stockFilter.value.trim() || null,
-                history: chatHistory.slice(-6),
+                history: historySnapshot,
             }),
         });
         const data = await res.json();
-        loadingEl.remove();
 
-        const msgIdx = messageIndex;
-        const sources = data.sources || [];
-        currentSources[msgIdx] = sources;
-
-        const processedAnswer = processSourceRefs(data.answer, msgIdx);
-        const msgEl = appendMessage("assistant", processedAnswer);
-
-        if (sources.length > 0) {
-            const sourcesBar = document.createElement("div");
-            sourcesBar.className = "sources-bar";
-            sourcesBar.innerHTML = sources.map(s => `
-                <span class="source-chip" data-msg="${msgIdx}" data-src="${s.id}"
-                      onmouseenter="showPopoverForSource(event, ${msgIdx}, ${s.id})"
-                      onmouseleave="scheduleHidePopover()">
-                    <span class="chip-num">[${s.id}]</span>
-                    ${escapeHtml(s.broker)} ${escapeHtml(s.date)}
-                </span>
-            `).join("");
-            msgEl.querySelector(".message-content").appendChild(sourcesBar);
-        }
-
-        // 更新 chatHistory（給 API 用）
-        chatHistory.push({ role: "user", content: question });
-        chatHistory.push({ role: "assistant", content: data.answer });
-
-        // 寫入 conv.messages（含精簡後的 sources）
-        const conv = getConv(activeConvId);
-        if (conv) {
-            if (!conv.messages) conv.messages = [];
-            conv.messages.push({ role: "user", content: question });
-            conv.messages.push({
+        // ★ 回覆存到發送時的對話（即使使用者已切走）
+        const targetConv = getConv(sendConvId);
+        if (targetConv) {
+            if (!targetConv.messages) targetConv.messages = [];
+            targetConv.messages.push({
                 role: "assistant",
                 content: data.answer,
-                sources: trimSources(sources),
+                sources: trimSources(data.sources || []),
             });
-            console.log(`[ANALYST] Saved message to conv ${activeConvId}, total: ${conv.messages.length} msgs`);
-        } else {
-            console.error(`[ANALYST] Could not find conv ${activeConvId} to save message!`);
+            // 更新 preview
+            const plain = (data.answer || "").replace(/[#*_`>\[\]]/g, "").trim();
+            targetConv.preview = plain.length > 60 ? plain.slice(0, 60) + "…" : plain;
+            targetConv.updatedAt = Date.now();
+            // 移到最前面
+            conversations = conversations.filter(c => c.id !== targetConv.id);
+            conversations.unshift(targetConv);
+            saveConversations();
+            console.log(`[ANALYST] Saved assistant reply to conv ${sendConvId}, total: ${targetConv.messages.length} msgs`);
         }
 
-        updateConversationMeta(question, data.answer);
-        // 立即存檔
-        const saved = saveConversations();
-        console.log(`[ANALYST] Save after send: ${saved ? 'OK' : 'FAILED'}`);
+        // ★ 只有還在同一對話時才更新 UI
+        if (activeConvId === sendConvId) {
+            loadingEl.remove();
+
+            const msgIdx = messageIndex;
+            const sources = data.sources || [];
+            currentSources[msgIdx] = sources;
+
+            const processedAnswer = processSourceRefs(data.answer, msgIdx);
+            const msgEl = appendMessage("assistant", processedAnswer);
+
+            if (sources.length > 0) {
+                const sourcesBar = document.createElement("div");
+                sourcesBar.className = "sources-bar";
+                sourcesBar.innerHTML = sources.map(s => `
+                    <span class="source-chip" data-msg="${msgIdx}" data-src="${s.id}"
+                          onmouseenter="showPopoverForSource(event, ${msgIdx}, ${s.id})"
+                          onmouseleave="scheduleHidePopover()"
+                          onclick="openSourceReport(${msgIdx}, ${s.id})">
+                        <span class="chip-num">[${s.id}]</span>
+                        ${escapeHtml(s.broker)} ${escapeHtml(s.date)}
+                    </span>
+                `).join("");
+                msgEl.querySelector(".message-content").appendChild(sourcesBar);
+            }
+
+            chatHistory.push({ role: "assistant", content: data.answer });
+            renderConversationList();
+        } else {
+            // 已切走 → 只更新側邊欄，不動 UI
+            console.log(`[ANALYST] User switched away from ${sendConvId}, reply saved silently`);
+            renderConversationList();
+        }
 
     } catch (e) {
-        loadingEl.remove();
-        appendMessage("assistant", "抱歉，發生錯誤。請稍後再試。");
+        if (activeConvId === sendConvId) {
+            loadingEl.remove();
+            appendMessage("assistant", "抱歉，發生錯誤。請稍後再試。");
+        }
         console.error("[ANALYST] sendMessage error:", e);
     }
 
@@ -916,9 +945,14 @@ function pdfZoomOut() {
     renderPdfPage();
 }
 
-// ── Fullscreen：包含 toolbar + canvas ──
+// ── Fullscreen toggle：包含 toolbar + canvas ──
 function openPdfFullscreen(reportId) {
-    // 全螢幕整個 pdf-container（含 toolbar）
+    // 已在全螢幕 → 退出
+    if (document.fullscreenElement || document.webkitFullscreenElement) {
+        (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+        return;
+    }
+    // 進入全螢幕
     const container = document.querySelector(".pdf-container");
     if (!container) return;
     if (container.requestFullscreen) {

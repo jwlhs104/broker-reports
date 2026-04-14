@@ -82,9 +82,12 @@ async def call_llm(system_prompt: str, messages: list[dict]) -> str:
         return response.choices[0].message.content
     else:
         # Claude CLI 模式：用訂閱制，透過 subprocess 呼叫
-        # 把 system prompt 和 user message 組合成一個 prompt
-        user_msg = messages[-1]["content"] if messages else ""
-        full_prompt = f"{system_prompt}\n\n{user_msg}"
+        # 把 system prompt + 完整對話歷史組合成一個 prompt
+        conv_parts = [system_prompt, ""]
+        for m in messages:
+            role_label = "使用者" if m["role"] == "user" else "助手"
+            conv_parts.append(f"[{role_label}]\n{m['content']}")
+        full_prompt = "\n\n".join(conv_parts)
 
         # claude -p "prompt" --model sonnet 直接輸出結果
         proc = await asyncio.create_subprocess_exec(
@@ -375,12 +378,129 @@ def search_for_chat(question: str, stock_code: str | None = None, limit: int = 1
     return results[:limit]
 
 
+async def extract_search_intent(question: str, history: list[dict]) -> dict:
+    """Step 1: 用 LLM 結合上下文理解搜尋意圖。
+
+    回傳 {"stock_codes": [...], "stock_names": [...], "keywords": [...], "resolved_question": "..."}
+    """
+    intent_prompt = """你是搜尋意圖分析器。根據使用者的對話歷史和最新問題，提取要搜尋的條件。
+
+你必須只回傳 JSON，不要有其他文字。格式如下：
+{
+  "stock_codes": ["2330", "2454"],
+  "stock_names": ["台積電", "聯發科"],
+  "keywords": ["目標價", "AI伺服器"],
+  "resolved_question": "把指代詞解析後的完整問題"
+}
+
+規則：
+1. stock_codes: 提取所有提到的台股代碼（4位數字）
+2. stock_names: 提取所有提到的股票名稱（含簡稱如「台積」→「台積電」）
+3. keywords: 提取搜尋關鍵字（產業、主題、分析角度等）
+4. resolved_question: 將「它」「這家公司」「上面那個」等指代詞替換為實際名稱，結合上下文還原完整問題
+5. 如果對話歷史中提到某支股票，而最新問題是「那XXX呢？」或「它的目標價？」，要正確識別指代的股票
+6. 如果使用者問的是通用問題（如「AI產業趨勢」），stock_codes 可以為空，靠 keywords 搜尋"""
+
+    conv_messages = []
+    for h in history[-6:]:
+        conv_messages.append({"role": h["role"], "content": h["content"]})
+    conv_messages.append({"role": "user", "content": question})
+
+    try:
+        raw = await call_llm(intent_prompt, conv_messages)
+        # 清理：移除 markdown code block 標記
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
+
+        intent = json.loads(cleaned)
+        logger.info(f"[Intent] question='{question}' → {intent}")
+        return intent
+    except (json.JSONDecodeError, Exception) as e:
+        logger.warning(f"[Intent] LLM parse failed: {e}, falling back to regex")
+        # Fallback: 用原本的 regex 提取
+        terms = extract_search_terms(question)
+        return {
+            "stock_codes": terms["stock_codes"],
+            "stock_names": terms["stock_names"],
+            "keywords": terms["keywords"],
+            "resolved_question": question,
+        }
+
+
+def search_by_intent(intent: dict, stock_code: str | None = None, limit: int = 10) -> list[Report]:
+    """Step 2: 根據 LLM 提取的意圖搜尋報告。"""
+    seen_ids = set()
+    results = []
+
+    def _add(reports, max_count: int = 0):
+        added = 0
+        for r in reports:
+            if r.id not in seen_ids:
+                seen_ids.add(r.id)
+                results.append(r)
+                added += 1
+                if max_count and added >= max_count:
+                    break
+
+    # 手動指定的 stock_code filter
+    if stock_code:
+        _add(search_reports(stock_code=stock_code))
+        if len(results) >= limit:
+            return results[:limit]
+
+    # 從 intent 取得的股票代碼
+    codes = intent.get("stock_codes", [])
+    names = intent.get("stock_names", [])
+    keywords = intent.get("keywords", [])
+
+    # 用股票名稱反查代碼（LLM 可能只給名稱沒給代碼）
+    name_map = _get_stock_name_map()
+    for name in names:
+        code = name_map.get(name)
+        if code and code not in codes:
+            codes.append(code)
+
+    # 1. 股票代碼搜尋（均勻分配）
+    if codes:
+        per_stock = max(3, limit // len(codes))
+        for code in codes:
+            _add(search_reports(stock_code=code), max_count=per_stock)
+
+    # 2. 關鍵字補充搜尋
+    for kw in keywords:
+        if len(results) >= limit:
+            break
+        _add(smart_search(kw, limit=limit - len(results)))
+
+    # 3. Fallback: resolved_question 全文搜尋
+    if not results:
+        resolved = intent.get("resolved_question", "")
+        if resolved:
+            _add(fulltext_search(resolved, limit=limit))
+        if not results:
+            _add(smart_search(resolved or "", limit=limit))
+
+    return results[:limit]
+
+
 @app.post("/api/chat")
 async def api_chat(req: ChatRequest):
-    """RAG Chat — 搜尋相關報告 → Claude 回答並標註 source"""
+    """RAG Chat — LLM 意圖提取 → 搜尋報告 → LLM 生成回答"""
 
-    # Step 1: 多路搜尋相關報告
-    reports = search_for_chat(req.question, req.stock_code, limit=10)
+    # Step 1: LLM 結合上下文提取搜尋意圖
+    intent = await extract_search_intent(req.question, req.history)
+    resolved_question = intent.get("resolved_question", req.question)
+
+    # Step 2: 根據意圖搜尋報告
+    reports = search_by_intent(intent, req.stock_code, limit=10)
+
+    if not reports:
+        # Fallback: 用原始 regex 再搜一次
+        reports = search_for_chat(req.question, req.stock_code, limit=10)
 
     if not reports:
         return ChatResponse(
@@ -391,10 +511,10 @@ async def api_chat(req: ChatRequest):
     # 限制最多 8 份報告送入 context
     reports = reports[:8]
 
-    # Step 2: 組裝 context
+    # Step 3: 組裝 context
     context_parts = []
     for i, r in enumerate(reports, 1):
-        raw = (r.raw_text or "")[:3000]  # 每份報告截取前 3000 字
+        raw = (r.raw_text or "")[:3000]
         context_parts.append(
             f"[報告 {i}] ID={r.id}\n"
             f"券商: {r.broker} | 日期: {r.report_date} | 股票: {r.stock_code} {r.stock_name}\n"
@@ -406,7 +526,7 @@ async def api_chat(req: ChatRequest):
 
     context = "\n---\n".join(context_parts)
 
-    # Step 3: 呼叫 LLM
+    # Step 4: 呼叫 LLM 生成回答
     system_prompt = """你是專業的台股券商報告研究助手。根據提供的券商報告內容回答使用者問題。
 
 規則：
@@ -430,7 +550,7 @@ async def api_chat(req: ChatRequest):
     messages.append(
         {
             "role": "user",
-            "content": f"以下是相關券商報告：\n\n{context}\n\n使用者問題：{req.question}",
+            "content": f"以下是相關券商報告：\n\n{context}\n\n使用者問題：{resolved_question}",
         }
     )
 
