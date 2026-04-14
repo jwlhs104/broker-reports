@@ -468,7 +468,6 @@ async function sendMessage() {
     contentEl.className = "message-content";
     contentEl.innerHTML = `<div class="stream-status" style="color:var(--text-muted);font-size:13px;display:flex;align-items:center;gap:8px">
         <div class="typing-indicator" style="display:inline-flex"><span></span><span></span><span></span></div>
-        <span>正在分析問題...</span>
     </div>
     <div class="stream-text"></div>`;
     msgEl.appendChild(contentEl);
@@ -523,15 +522,6 @@ async function sendMessage() {
                 }
 
                 switch (eventType) {
-                    case "status":
-                        if (eventData) {
-                            statusEl.querySelector("span:last-child").textContent = eventData;
-                            statusEl.style.display = "flex";
-                        } else {
-                            statusEl.style.display = "none";
-                        }
-                        break;
-
                     case "sources_preview":
                         // 提前收到報告 metadata
                         try {
@@ -541,6 +531,7 @@ async function sendMessage() {
                         break;
 
                     case "chunk":
+                        statusEl.style.display = "none";
                         rawAnswer += eventData;
                         // 即時渲染 markdown（每個 chunk 都重新 parse 整段）
                         if (activeConvId === sendConvId) {

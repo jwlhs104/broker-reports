@@ -738,14 +738,11 @@ async def api_chat_stream(req: ChatRequest):
     """SSE Streaming RAG Chat — 意圖提取 → 搜尋 → 串流回答"""
 
     async def event_generator():
-        # ── Phase 1: 意圖提取（非串流，但發送狀態通知）──
-        yield _sse_event("status", "正在分析問題...")
-
+        # ── Phase 1: 意圖提取 ──
         intent = await extract_search_intent(req.question, req.history)
         resolved_question = intent.get("resolved_question", req.question)
 
         # ── Phase 2: 搜尋報告 ──
-        yield _sse_event("status", "正在搜尋相關報告...")
 
         reports = search_by_intent(intent, req.stock_code, limit=10)
         if not reports:
@@ -819,7 +816,6 @@ async def api_chat_stream(req: ChatRequest):
         )
 
         # ── Phase 4: 串流回答 ──
-        yield _sse_event("status", "")  # 清除狀態
 
         full_answer = []
         buffer = ""
