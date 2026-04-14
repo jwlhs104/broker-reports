@@ -50,6 +50,8 @@ $input.addEventListener("input", autoResize);
 $toggleSidebar.addEventListener("click", toggleSidebar);
 $newChatBtn.addEventListener("click", () => { startNewChat(); closeSidebarOnMobile(); });
 if ($sidebarBackdrop) $sidebarBackdrop.addEventListener("click", closeSidebarOnMobile);
+const $sidebarClose = document.getElementById("sidebar-close");
+if ($sidebarClose) $sidebarClose.addEventListener("click", closeSidebarOnMobile);
 
 document.addEventListener("click", (e) => {
     if (!e.target.closest(".source-ref") && !e.target.closest(".source-chip") && !e.target.closest("#source-popover")) {
