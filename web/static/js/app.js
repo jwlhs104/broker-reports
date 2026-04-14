@@ -13,6 +13,7 @@ const $statsBadge = document.getElementById("stats-badge");
 const $popover = document.getElementById("source-popover");
 const $convList = document.getElementById("conversation-list");
 const $newChatBtn = document.getElementById("new-chat-btn");
+const $sidebarBackdrop = document.getElementById("sidebar-backdrop");
 
 // ══════════════════════════════════════════════════════════
 //  Conversation State
@@ -46,8 +47,9 @@ $input.addEventListener("keydown", (e) => {
     }
 });
 $input.addEventListener("input", autoResize);
-$toggleSidebar.addEventListener("click", () => $sidebar.classList.toggle("collapsed"));
-$newChatBtn.addEventListener("click", startNewChat);
+$toggleSidebar.addEventListener("click", toggleSidebar);
+$newChatBtn.addEventListener("click", () => { startNewChat(); closeSidebarOnMobile(); });
+if ($sidebarBackdrop) $sidebarBackdrop.addEventListener("click", closeSidebarOnMobile);
 
 document.addEventListener("click", (e) => {
     if (!e.target.closest(".source-ref") && !e.target.closest(".source-chip") && !e.target.closest("#source-popover")) {
@@ -56,6 +58,30 @@ document.addEventListener("click", (e) => {
 });
 
 window.addEventListener("beforeunload", () => saveCurrentConversation());
+
+// ══════════════════════════════════════════════════════════
+//  Sidebar (Mobile)
+// ══════════════════════════════════════════════════════════
+function isMobile() { return window.innerWidth <= 900; }
+
+function toggleSidebar() {
+    $sidebar.classList.toggle("collapsed");
+    if ($sidebarBackdrop) {
+        $sidebarBackdrop.classList.toggle("active", !$sidebar.classList.contains("collapsed") && isMobile());
+    }
+}
+
+function closeSidebarOnMobile() {
+    if (isMobile()) {
+        $sidebar.classList.add("collapsed");
+        if ($sidebarBackdrop) $sidebarBackdrop.classList.remove("active");
+    }
+}
+
+// On mobile, start with sidebar collapsed
+if (isMobile()) {
+    $sidebar.classList.add("collapsed");
+}
 
 // ══════════════════════════════════════════════════════════
 //  Conversation Management (localStorage)
@@ -149,6 +175,7 @@ function startNewChat() {
 
 function switchConversation(id) {
     console.log(`[ANALYST] Switching to conversation: ${id}`);
+    closeSidebarOnMobile();
 
     // 先儲存當前對話
     if (activeConvId && activeConvId !== id) {

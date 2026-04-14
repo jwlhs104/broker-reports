@@ -1372,12 +1372,301 @@ body {
 /* ══════════════════════════════════════════════════════════
    RESPONSIVE
    ══════════════════════════════════════════════════════════ */
+
+/* ── Tablet (≤ 900px) ── */
 @media (max-width: 900px) {
     #sidebar {
-        position: absolute;
-        z-index: 100;
+        position: fixed;
+        z-index: 500;
         height: 100vh;
+        width: 320px;
+        min-width: 320px;
+        box-shadow: 4px 0 24px rgba(0,0,0,0.12);
     }
-    .modal-content { width: 95vw; }
+
+    #sidebar.collapsed {
+        transform: translateX(-100%);
+        opacity: 0;
+        pointer-events: none;
+    }
+
+    /* Backdrop overlay when sidebar is open */
+    .sidebar-backdrop {
+        display: none;
+        position: fixed;
+        inset: 0;
+        background: rgba(31, 27, 22, 0.3);
+        z-index: 499;
+        backdrop-filter: blur(2px);
+    }
+
+    .sidebar-backdrop.active {
+        display: block;
+    }
+
+    .modal-content {
+        width: 95vw;
+        max-height: 95vh;
+    }
+
+    .modal-inner { padding: 24px 20px; }
+
+    .modal-hero {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 12px;
+    }
+
+    .modal-broker-name,
+    .modal-report-date { text-align: left; }
+
+    .modal-stock-code { font-size: 34px; }
+
+    .modal-kpi-row {
+        flex-wrap: wrap;
+        gap: 10px;
+    }
+
+    .modal-kpi-card {
+        flex: 1 1 calc(50% - 5px);
+        min-width: 0;
+    }
+
     .welcome-hero h2 { font-size: 32px; }
+    .welcome-hero p { font-size: 14px; }
+
+    .source-popover {
+        width: 340px;
+    }
+
+    .messages { padding: 24px 16px; }
+    .message { max-width: 88%; }
+
+    .chat-header { padding: 12px 16px; }
+    .input-area { padding: 12px 16px 16px; }
+}
+
+/* ── Mobile (≤ 640px) ── */
+@media (max-width: 640px) {
+    #sidebar {
+        width: 100%;
+        min-width: 100%;
+    }
+
+    .chat-header {
+        padding: 10px 12px;
+        gap: 10px;
+    }
+
+    .header-title-group h1 {
+        font-size: 17px;
+    }
+
+    .header-divider { display: none; }
+
+    .stock-filter {
+        flex-direction: column;
+        gap: 4px;
+    }
+
+    .stock-filter label { display: none; }
+
+    .stock-filter input {
+        width: 90px;
+        padding: 6px 10px;
+        font-size: 12px;
+    }
+
+    .messages {
+        padding: 16px 10px;
+        gap: 14px;
+    }
+
+    .message {
+        max-width: 94%;
+    }
+
+    .message-content {
+        padding: 12px 14px;
+        font-size: 13px;
+        line-height: 1.65;
+    }
+
+    .message-content h1 { font-size: 17px; }
+    .message-content h2 { font-size: 15px; }
+    .message-content h3 { font-size: 14px; }
+
+    .message-content table {
+        font-size: 11px;
+        display: block;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+    }
+
+    .message-content thead th,
+    .message-content tbody td {
+        padding: 6px 8px;
+        white-space: nowrap;
+    }
+
+    .message-content pre {
+        font-size: 11px;
+        padding: 10px 12px;
+    }
+
+    .input-area { padding: 8px 10px 12px; }
+
+    #user-input {
+        padding: 10px 12px;
+        font-size: 14px;
+        min-height: 42px;
+    }
+
+    #send-btn {
+        width: 42px;
+        height: 42px;
+    }
+
+    .input-hint { font-size: 10px; }
+
+    /* Welcome */
+    .welcome-hero {
+        padding: 32px 0 24px;
+    }
+
+    .welcome-hero h2 {
+        font-size: 26px;
+        letter-spacing: -0.5px;
+    }
+
+    .welcome-hero p {
+        font-size: 13px;
+        max-width: 100%;
+    }
+
+    .welcome-tag {
+        font-size: 9px;
+        padding: 4px 10px;
+    }
+
+    .prompt-chip {
+        padding: 11px 14px;
+        font-size: 13px;
+        gap: 10px;
+    }
+
+    .chip-icon {
+        width: 30px;
+        height: 30px;
+        font-size: 14px;
+    }
+
+    /* Sources */
+    .sources-bar {
+        gap: 4px;
+    }
+
+    .source-chip {
+        padding: 4px 10px;
+        font-size: 11px;
+    }
+
+    /* Modal */
+    .modal-overlay {
+        align-items: flex-end;
+        padding: 0;
+    }
+
+    .modal-content {
+        width: 100vw;
+        max-height: 92vh;
+        border-radius: var(--radius-xl) var(--radius-xl) 0 0;
+        animation: modalSlideUp 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    @keyframes modalSlideUp {
+        from { transform: translateY(100%); }
+        to { transform: translateY(0); }
+    }
+
+    .modal-inner { padding: 20px 16px; }
+
+    .modal-stock-code { font-size: 28px; }
+    .modal-stock-name { font-size: 13px; }
+
+    .modal-kpi-row {
+        gap: 8px;
+    }
+
+    .modal-kpi-card {
+        flex: 1 1 100%;
+        padding: 14px;
+    }
+
+    .kpi-label {
+        font-size: 9px;
+        letter-spacing: 1.5px;
+        margin-bottom: 6px;
+    }
+
+    .kpi-value { font-size: 16px; }
+    .kpi-score { font-size: 24px; }
+
+    .modal-tabs {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+    }
+
+    .modal-tab {
+        padding: 8px 14px;
+        font-size: 12px;
+        white-space: nowrap;
+    }
+
+    .modal-section-body { font-size: 13px; }
+
+    .modal-raw-text {
+        max-height: 350px;
+        padding: 16px;
+        font-size: 12px;
+    }
+
+    /* PDF */
+    .pdf-canvas-wrap {
+        height: 400px;
+    }
+
+    .pdf-toolbar {
+        padding: 6px 8px;
+        gap: 4px;
+        flex-wrap: wrap;
+    }
+
+    .pdf-nav-btn {
+        min-width: 28px;
+        height: 28px;
+        font-size: 12px;
+        padding: 0 6px;
+    }
+
+    .pdf-page-info {
+        font-size: 11px;
+        min-width: 50px;
+    }
+
+    /* Popover — full-width bottom sheet on mobile */
+    .source-popover {
+        width: calc(100vw - 16px);
+        left: 8px !important;
+        max-width: none;
+    }
+
+    .popover-excerpt { max-height: 120px; }
+
+    /* Sidebar brand */
+    .sidebar-brand { padding: 16px 20px; }
+    .brand-mark { width: 28px; height: 28px; font-size: 15px; }
+    .brand-name { font-size: 12px; }
+
+    .sidebar-section-label { padding: 10px 20px 4px; }
 }
