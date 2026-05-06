@@ -175,10 +175,24 @@ async def call_llm_stream(system_prompt: str, messages: list[dict], model: str =
 # ── Pydantic models ──
 
 
+class DataSourceConfig(BaseModel):
+    broker_reports: bool = True
+    financial_statements: bool = False
+    earnings_presentations: bool = False
+    web_search: bool = False
+
+
+class CustomContext(BaseModel):
+    name: str
+    content: str
+
+
 class ChatRequest(BaseModel):
     question: str
     stock_code: str | None = None
     history: list[dict] = []  # [{role, content}]
+    data_sources: DataSourceConfig = DataSourceConfig()
+    custom_context: list[CustomContext] = []
 
 
 class Source(BaseModel):
@@ -733,6 +747,164 @@ def _sse_event(event: str, data: str) -> str:
     return f"event: {event}\ndata: {lines}\n\n"
 
 
+# ══════════════════════════════════════════════════════════
+#  外部資料來源擷取（財報、法說會、Web Search）
+# ══════════════════════════════════════════════════════════
+
+
+async def _call_claude_with_web(prompt: str, model: str = "haiku") -> str:
+    """呼叫 Claude CLI 並啟用 WebSearch + WebFetch 工具。
+
+    讓 Claude agent 自行搜尋網路、擷取網頁，回傳整理過的結果。
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "claude",
+        "-p",
+        prompt,
+        "--model",
+        model,
+        "--allowedTools",
+        "mcp__fetch__fetch,WebSearch,WebFetch",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, "NO_COLOR": "1"},
+    )
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+
+    if proc.returncode != 0:
+        err = stderr.decode().strip()
+        logger.warning(f"[WebAgent] Claude CLI error: {err}")
+        return ""
+
+    return stdout.decode().strip()
+
+
+def _parse_web_result(raw: str) -> tuple[list[str], str]:
+    """解析 Claude WebSearch 回傳的 ---SOURCES--- / ---CONTENT--- 格式。
+
+    回傳 (source_urls, content)
+    """
+    source_urls = []
+    content = raw
+
+    if "---SOURCES---" in raw and "---CONTENT---" in raw:
+        parts = raw.split("---CONTENT---", 1)
+        source_part = parts[0].split("---SOURCES---", 1)[-1].strip()
+        source_urls = [line.strip() for line in source_part.split("\n") if line.strip()]
+        content = parts[1].strip()
+    elif "---CONTENT---" in raw:
+        content = raw.split("---CONTENT---", 1)[-1].strip()
+
+    return source_urls, content
+
+
+async def fetch_financial_statements(stock_codes: list[str]) -> list[dict]:
+    """用 Claude WebSearch 搜尋個股財報資料。
+
+    回傳 [{"name": "...", "content": "...", "sources": ["url1", ...]}]
+    """
+    results = []
+    for code in stock_codes[:3]:
+        prompt = (
+            f"請搜尋台股 {code} 的最新財報資訊。\n\n"
+            "搜尋策略：\n"
+            f"1. 優先搜尋「{code} 財報」或到財報狗 statementdog.com 查詢\n"
+            f"2. 也可搜尋「{code} 營收 EPS 毛利率」等關鍵字\n\n"
+            "請回傳以下格式（純文字，不要 markdown code block）：\n"
+            "---SOURCES---\n"
+            "來源名稱1 | 網址1\n"
+            "來源名稱2 | 網址2\n"
+            "---CONTENT---\n"
+            "整理後的財報重點摘要（包含：最近幾季營收、EPS、毛利率、營益率等關鍵數據）\n"
+        )
+        try:
+            raw = await _call_claude_with_web(prompt)
+            if not raw or len(raw) < 50:
+                continue
+
+            source_urls, content = _parse_web_result(raw)
+            results.append(
+                {
+                    "name": f"{code} 財報摘要",
+                    "content": content[:5000],
+                    "sources": source_urls[:5],
+                }
+            )
+        except Exception as e:
+            logger.warning(f"[FinancialStatements] Failed for {code}: {e}")
+            continue
+    return results
+
+
+async def fetch_earnings_call(stock_codes: list[str]) -> list[dict]:
+    """用 Claude WebSearch 搜尋法說會簡報資料。"""
+    results = []
+    for code in stock_codes[:3]:
+        prompt = (
+            f"請搜尋台股 {code} 的最新法說會簡報或法說會重點。\n\n"
+            "搜尋策略（依優先順序）：\n"
+            f"1. 搜尋「{code} 法說會 site:finmoconf.com」\n"
+            f"2. 搜尋「{code} 法說會簡報」找公司官網 IR 頁面\n"
+            f"3. 搜尋「{code} investor conference」\n\n"
+            "請回傳以下格式（純文字，不要 markdown code block）：\n"
+            "---SOURCES---\n"
+            "來源名稱1 | 網址1\n"
+            "來源名稱2 | 網址2\n"
+            "---CONTENT---\n"
+            "法說會重點整理（包含：管理層展望、營運目標、產能規劃、Q&A 重點等）\n"
+        )
+        try:
+            raw = await _call_claude_with_web(prompt)
+            if not raw or len(raw) < 50:
+                continue
+
+            source_urls, content = _parse_web_result(raw)
+            results.append(
+                {
+                    "name": f"{code} 法說會摘要",
+                    "content": content[:5000],
+                    "sources": source_urls[:5],
+                }
+            )
+        except Exception as e:
+            logger.warning(f"[EarningsCall] Failed for {code}: {e}")
+            continue
+    return results
+
+
+async def fetch_web_search(question: str, stock_codes: list[str]) -> list[dict]:
+    """用 Claude WebSearch 搜尋補充資料。"""
+    code_str = " ".join(stock_codes[:2]) if stock_codes else ""
+    prompt = (
+        f"請搜尋以下問題的相關資料作為投資研究的補充：\n\n"
+        f"問題：{question}\n"
+        f"相關股票：{code_str}\n\n"
+        "搜尋範圍：新聞、分析師評論、產業報告、市場數據等。\n\n"
+        "請回傳以下格式（純文字，不要 markdown code block）：\n"
+        "---SOURCES---\n"
+        "來源名稱1 | 網址1\n"
+        "來源名稱2 | 網址2\n"
+        "---CONTENT---\n"
+        "整理後的重點摘要，每個資訊點標註來自哪個來源\n"
+    )
+    try:
+        raw = await _call_claude_with_web(prompt)
+        if not raw or len(raw) < 50:
+            return []
+
+        source_urls, content = _parse_web_result(raw)
+        return [
+            {
+                "name": "外部網路資料",
+                "content": content[:6000],
+                "sources": source_urls[:5],
+            }
+        ]
+    except Exception as e:
+        logger.warning(f"[WebSearch] Failed: {e}")
+        return []
+
+
 @app.post("/api/chat/stream")
 async def api_chat_stream(req: ChatRequest):
     """SSE Streaming RAG Chat — 意圖提取 → 搜尋 → 串流回答"""
@@ -748,7 +920,15 @@ async def api_chat_stream(req: ChatRequest):
         if not reports:
             reports = search_for_chat(req.question, req.stock_code, limit=10)
 
-        if not reports:
+        # 如果有其他資料來源開啟，不因找不到報告就中斷
+        has_other_sources = (
+            req.data_sources.financial_statements
+            or req.data_sources.earnings_presentations
+            or req.data_sources.web_search
+            or req.custom_context
+        )
+
+        if not reports and not has_other_sources:
             yield _sse_event("chunk", "找不到相關的券商報告。請嘗試其他關鍵字或股票代碼。")
             yield _sse_event("sources", "[]")
             yield _sse_event("done", "")
@@ -775,35 +955,183 @@ async def api_chat_stream(req: ChatRequest):
             )
         yield _sse_event("sources_preview", json.dumps(report_meta, ensure_ascii=False))
 
+        # 送出 related 報告用的 stock_codes（讓前端可以同步抓取右側欄）
+        # 從報告 + intent 兩處取得股票代碼
+        related_codes = list({r.stock_code for r in reports if r.stock_code})
+        if not related_codes:
+            # 報告不夠時，從 intent 取得股票代碼（給外部資料源用）
+            related_codes = intent.get("stock_codes", [])
+            if req.stock_code:
+                related_codes = [req.stock_code] + [c for c in related_codes if c != req.stock_code]
+        report_ids = [r.id for r in reports]
+        yield _sse_event(
+            "related_hint",
+            json.dumps({"stock_codes": related_codes, "exclude_ids": report_ids}, ensure_ascii=False),
+        )
+
         # ── Phase 3: 組裝 context ──
         context_parts = []
-        for i, r in enumerate(reports, 1):
-            raw = (r.raw_text or "")[:3000]
-            context_parts.append(
-                f"[報告 {i}] ID={r.id}\n"
-                f"券商: {r.broker} | 日期: {r.report_date} | 股票: {r.stock_code} {r.stock_name}\n"
-                f"評等: {r.rating} | 目標價: {r.target_price}\n"
-                f"摘要: {r.summary}\n"
-                f"投資邏輯: {r.investment_thesis}\n"
-                f"原文:\n{raw}\n"
+
+        # 3a. 券商報告
+        if req.data_sources.broker_reports:
+            for i, r in enumerate(reports, 1):
+                raw = (r.raw_text or "")[:3000]
+                context_parts.append(
+                    f"[報告 {i}] ID={r.id}\n"
+                    f"券商: {r.broker} | 日期: {r.report_date} | 股票: {r.stock_code} {r.stock_name}\n"
+                    f"評等: {r.rating} | 目標價: {r.target_price}\n"
+                    f"摘要: {r.summary}\n"
+                    f"投資邏輯: {r.investment_thesis}\n"
+                    f"原文:\n{raw}\n"
+                )
+
+        # 從意圖中取得股票代碼，供外部資料源使用
+        stock_codes = related_codes  # 已從 reports 提取
+
+        # 收集外部來源（財報、法說會、外網），供 system prompt 和 SSE 使用
+        external_sources = {
+            "financial": [],  # [{"name": ..., "content": ..., "sources": [...]}]
+            "earnings": [],
+            "web": [],
+        }
+
+        # 3b. 財報
+        if req.data_sources.financial_statements and stock_codes:
+            yield _sse_event("chunk", "🔍 正在搜尋財報資料...\n\n")
+            try:
+                fin_data = await fetch_financial_statements(stock_codes)
+                external_sources["financial"] = fin_data
+                for j, fd in enumerate(fin_data, 1):
+                    src_links = "\n".join(f"  - {s}" for s in fd.get("sources", []))
+                    context_parts.append(
+                        f"[財報資料 F{j}] {fd['name']}\n參考來源:\n{src_links}\n內容:\n{fd['content']}\n"
+                    )
+                if fin_data:
+                    yield _sse_event("chunk", f"✅ 找到 {len(fin_data)} 筆財報資料\n\n")
+                else:
+                    yield _sse_event("chunk", "⚠️ 未找到財報資料\n\n")
+            except Exception as e:
+                logger.warning(f"[FinancialStatements] Error: {e}")
+                yield _sse_event("chunk", "⚠️ 財報資料擷取失敗\n\n")
+
+        # 3c. 法說會簡報
+        if req.data_sources.earnings_presentations and stock_codes:
+            yield _sse_event("chunk", "🔍 正在搜尋法說會資料...\n\n")
+            try:
+                ec_data = await fetch_earnings_call(stock_codes)
+                external_sources["earnings"] = ec_data
+                for j, ec in enumerate(ec_data, 1):
+                    src_links = "\n".join(f"  - {s}" for s in ec.get("sources", []))
+                    context_parts.append(
+                        f"[法說會資料 E{j}] {ec['name']}\n參考來源:\n{src_links}\n內容:\n{ec['content']}\n"
+                    )
+                if ec_data:
+                    yield _sse_event("chunk", f"✅ 找到 {len(ec_data)} 筆法說會資料\n\n")
+                else:
+                    yield _sse_event("chunk", "⚠️ 未找到法說會資料\n\n")
+            except Exception as e:
+                logger.warning(f"[EarningsCall] Error: {e}")
+                yield _sse_event("chunk", "⚠️ 法說會資料擷取失敗\n\n")
+
+        # 3d. 外網資料（Claude WebSearch）
+        if req.data_sources.web_search:
+            yield _sse_event("chunk", "🔍 正在搜尋外部網路資料...\n\n")
+            try:
+                web_data = await fetch_web_search(resolved_question, stock_codes)
+                external_sources["web"] = web_data
+                for j, wd in enumerate(web_data, 1):
+                    src_links = "\n".join(f"  - {s}" for s in wd.get("sources", []))
+                    context_parts.append(
+                        f"[外部資料 W{j}] {wd['name']}\n參考來源:\n{src_links}\n內容:\n{wd['content']}\n"
+                    )
+                if web_data:
+                    yield _sse_event("chunk", "✅ 找到外部網路資料\n\n")
+                else:
+                    yield _sse_event("chunk", "⚠️ 未找到相關外部資料\n\n")
+            except Exception as e:
+                logger.warning(f"[WebSearch] Error: {e}")
+                yield _sse_event("chunk", "⚠️ 外部資料擷取失敗\n\n")
+
+        # 送出外部來源 metadata 給前端（用於渲染來源連結區塊）
+        if any(external_sources.values()):
+            yield _sse_event(
+                "external_sources",
+                json.dumps(
+                    {
+                        k: [{"name": d["name"], "sources": d.get("sources", [])} for d in v]
+                        for k, v in external_sources.items()
+                        if v
+                    },
+                    ensure_ascii=False,
+                ),
             )
+
+        # 3e. 使用者匯入的自訂資料
+        if req.custom_context:
+            for j, ctx in enumerate(req.custom_context, 1):
+                context_parts.append(f"[使用者匯入資料 U{j}] 來源: {ctx.name}\n內容:\n{ctx.content[:5000]}\n")
+
         context = "\n---\n".join(context_parts)
 
-        system_prompt = """你是專業的台股券商報告研究助手。根據提供的券商報告內容回答使用者問題。
+        # 根據資料來源開關調整 system prompt
+        active_sources = []
+        if req.data_sources.broker_reports:
+            active_sources.append("券商報告")
+        if req.data_sources.financial_statements:
+            active_sources.append("財務報表")
+        if req.data_sources.earnings_presentations:
+            active_sources.append("法說會簡報")
+        if req.data_sources.web_search:
+            active_sources.append("外部網路資料")
+        sources_note = "、".join(active_sources) if active_sources else "券商報告"
 
-規則：
-1. 回答中每個論點必須標註來源，格式為 [n]，n 是報告編號
-2. 不同券商觀點有衝突時，並列呈現並標註各自來源
-3. 如果報告資料不足以回答，明確說明
-4. 回答使用繁體中文
-5. 回答結尾用 JSON 格式附上 sources 陣列，格式如下：
-<!--SOURCES_JSON-->
-[
-  {"id": 1, "report_id": 報告ID, "excerpt": "引用的原文段落50-150字"},
-  ...
-]
-<!--/SOURCES_JSON-->
-每個被引用的報告都要有一個 source entry，excerpt 是你引用該報告時對應的原文段落。"""
+        # 根據啟用的外部來源，動態加入區塊格式指引
+        section_rules = ""
+        has_fin = bool(external_sources.get("financial"))
+        has_ec = bool(external_sources.get("earnings"))
+        has_web = bool(external_sources.get("web"))
+
+        if has_fin or has_ec or has_web:
+            section_rules = "\n\n### 回答結構要求\n回答正文之後，請依序加上以下區塊（僅限有資料的）：\n"
+            if has_fin:
+                section_rules += (
+                    "\n**📊 財報摘要**\n"
+                    "- 用 `## 📊 財報摘要` 作為標題\n"
+                    "- 列出關鍵財務數據（營收、EPS、毛利率等）\n"
+                    "- 區塊最後用「📎 資料來源：」列出所有參考來源的超連結，格式：[來源名稱](URL)\n"
+                    "- 來源 URL 在 context 中的「參考來源」欄位\n"
+                )
+            if has_ec:
+                section_rules += (
+                    "\n**🎤 法說會重點**\n"
+                    "- 用 `## 🎤 法說會重點` 作為標題\n"
+                    "- 列出管理層展望、營運目標、產能規劃、Q&A 重點等\n"
+                    "- 區塊最後用「📎 資料來源：」列出所有參考來源的超連結，格式：[來源名稱](URL)\n"
+                    "- 來源 URL 在 context 中的「參考來源」欄位\n"
+                )
+            if has_web:
+                section_rules += (
+                    "\n**🌐 外部資料補充**\n"
+                    "- 用 `## 🌐 外部資料補充` 作為標題\n"
+                    "- 整理外部搜尋到的補充資訊\n"
+                    "- 區塊最後用「📎 資料來源：」列出所有參考來源的超連結，格式：[來源名稱](URL)\n"
+                )
+
+        system_prompt = (
+            f"你是專業的台股券商報告研究助手。根據提供的{sources_note}內容回答使用者問題。\n\n"
+            "規則：\n"
+            "1. 回答中每個論點必須標註來源，格式為 [n]，n 是報告編號\n"
+            "2. 不同券商觀點有衝突時，並列呈現並標註各自來源\n"
+            "3. 如果報告資料不足以回答，明確說明\n"
+            "4. 回答使用繁體中文\n"
+            "5. 來源連結請使用 markdown 超連結格式 [名稱](URL)，不要只貼裸網址\n"
+            "6. 回答結尾用 JSON 格式附上 sources 陣列，格式如下：\n"
+            "<!--SOURCES_JSON-->\n"
+            '[\n  {"id": 1, "report_id": 報告ID, "excerpt": "引用的原文段落50-150字"},\n  ...\n]\n'
+            "<!--/SOURCES_JSON-->\n"
+            "每個被引用的報告都要有一個 source entry，excerpt 是你引用該報告時對應的原文段落。"
+            f"{section_rules}"
+        )
 
         messages = []
         for h in req.history[-6:]:
@@ -860,6 +1188,23 @@ async def api_chat_stream(req: ChatRequest):
             except json.JSONDecodeError:
                 pass
 
+        # Fallback: LLM 沒用 <!--SOURCES_JSON--> 標記，
+        # 但在正文尾端直接輸出了裸 JSON array
+        if source_data is None and not in_sources_block:
+            # 嘗試找文末的 JSON array
+            match = re.search(
+                r'\[\s*\{[^{]*?"report_id"\s*:.*\]\s*$',
+                answer_text,
+                re.DOTALL,
+            )
+            if match:
+                try:
+                    source_data = json.loads(match.group(0))
+                    # 從 answer_text 移除這段 JSON
+                    answer_text = answer_text[: match.start()].strip()
+                except json.JSONDecodeError:
+                    pass
+
         sources = _build_sources_from_reports(reports, answer_text, source_data)
         yield _sse_event("sources", json.dumps(sources, ensure_ascii=False))
         yield _sse_event("done", "")
@@ -883,3 +1228,218 @@ async def api_stats():
     done = session.query(Report).filter(Report.extraction_status == "done").count()
     session.close()
     return {"total": total, "done": done}
+
+
+# ══════════════════════════════════════════════════════════
+#  Related Reports endpoint
+# ══════════════════════════════════════════════════════════
+
+
+@app.get("/api/related")
+async def api_related(
+    stock_codes: str = "",
+    exclude_ids: str = "",
+    limit: int = 15,
+):
+    """取得高關聯的報告，用於右側欄"""
+
+    if not stock_codes:
+        return []
+
+    codes = [c.strip() for c in stock_codes.split(",") if c.strip()]
+    exclude = set()
+    if exclude_ids:
+        exclude = {int(x.strip()) for x in exclude_ids.split(",") if x.strip().isdigit()}
+
+    session = get_session()
+    seen_ids = set(exclude)
+    results = []
+
+    try:
+        # 1. 直接用股票代碼搜尋報告
+        for code in codes:
+            reports = (
+                session.query(Report)
+                .filter(Report.stock_code == code)
+                .filter(Report.extraction_status == "done")
+                .order_by(Report.report_date.desc())
+                .limit(limit)
+                .all()
+            )
+            for r in reports:
+                if r.id not in seen_ids:
+                    seen_ids.add(r.id)
+                    results.append((r, 1.0))
+
+        # 2. 搜尋 mentioned_stocks 包含這些代碼的報告
+        for code in codes:
+            mentioned = (
+                session.query(Report)
+                .filter(Report.extraction_status == "done")
+                .filter(Report.mentioned_stocks.contains(code))
+                .order_by(Report.report_date.desc())
+                .limit(10)
+                .all()
+            )
+            for r in mentioned:
+                if r.id not in seen_ids:
+                    seen_ids.add(r.id)
+                    results.append((r, 0.6))
+
+        # 3. 計算 is_first_coverage
+        # 取得每個 broker+stock_code 的最早報告日期
+        first_coverage_cache = {}
+        all_codes_in_results = set()
+        for r, _ in results:
+            if r.stock_code and r.broker:
+                all_codes_in_results.add(r.stock_code)
+
+        if all_codes_in_results:
+            from sqlalchemy import func as sqlfunc
+
+            first_dates = (
+                session.query(Report.stock_code, Report.broker, sqlfunc.min(Report.report_date))
+                .filter(Report.stock_code.in_(list(all_codes_in_results)))
+                .filter(Report.extraction_status == "done")
+                .group_by(Report.stock_code, Report.broker)
+                .all()
+            )
+            for sc, br, min_date in first_dates:
+                first_coverage_cache[(sc, br)] = min_date
+
+    finally:
+        session.close()
+
+    # 組裝回傳結果
+    output = []
+    for r, relevance_score in results:
+        is_first = False
+        if r.stock_code and r.broker:
+            first_date = first_coverage_cache.get((r.stock_code, r.broker))
+            if first_date and r.report_date and r.report_date == first_date:
+                is_first = True
+
+        tags = []
+        if relevance_score >= 0.8:
+            tags.append("關聯高")
+        if r.page_count and r.page_count >= 20:
+            tags.append("頁數多")
+        if is_first:
+            tags.append("初次覆蓋")
+
+        output.append(
+            {
+                "id": r.id,
+                "stock_code": r.stock_code or "",
+                "stock_name": r.stock_name or "",
+                "broker": r.broker or "",
+                "date": r.report_date.isoformat() if r.report_date else "",
+                "rating": r.rating,
+                "target_price": r.target_price,
+                "page_count": r.page_count,
+                "relevance_score": relevance_score,
+                "is_first_coverage": is_first,
+                "tags": tags,
+                "summary": (r.summary or "")[:150],
+            }
+        )
+
+    return output[:limit]
+
+
+# ══════════════════════════════════════════════════════════
+#  Import endpoints (file upload + URL fetch)
+# ══════════════════════════════════════════════════════════
+
+# 暫存匯入的資料（session-scoped, 記憶體中）
+_import_store: dict[str, dict] = {}
+
+from fastapi import File as _File  # noqa: E402
+from fastapi import UploadFile as _UploadFile  # noqa: E402
+
+
+@app.post("/api/import/file")
+async def api_import_file(file: _UploadFile = _File(...)):
+    """上傳檔案並提取文字內容"""
+    import hashlib as _hashlib
+    import tempfile as _tempfile
+
+    content = await file.read()
+    file_id = _hashlib.md5(content).hexdigest()[:12]
+
+    filename = file.filename or "uploaded"
+    ext = Path(filename).suffix.lower()
+
+    text = ""
+    if ext == ".pdf":
+        # 嘗試用 src/pdf_parser 提取
+        try:
+            with _tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(content)
+                tmp_path = tmp.name
+            from src.pdf_parser import extract_text
+
+            text = extract_text(tmp_path)
+            Path(tmp_path).unlink(missing_ok=True)
+        except Exception as e:
+            text = f"[PDF 文字提取失敗: {e}]"
+    elif ext in (".txt", ".md", ".csv", ".json"):
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            text = content.decode("big5", errors="replace")
+    else:
+        text = f"[不支援的檔案格式: {ext}]"
+
+    _import_store[file_id] = {"name": filename, "content": text}
+
+    return {
+        "id": file_id,
+        "name": filename,
+        "preview": text[:200] + ("..." if len(text) > 200 else ""),
+        "char_count": len(text),
+    }
+
+
+@app.post("/api/import/url")
+async def api_import_url(req: dict):
+    """從 URL 擷取文字內容"""
+    import hashlib as _hashlib
+
+    url = req.get("url", "").strip()
+    if not url:
+        return {"error": "URL is required"}
+
+    try:
+        import httpx as _httpx
+
+        async with _httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+            html = resp.text
+
+        # 簡單的 HTML → 文字（去 tag）
+        import re as _re
+
+        text = _re.sub(r"<script[^>]*>.*?</script>", "", html, flags=_re.DOTALL)
+        text = _re.sub(r"<style[^>]*>.*?</style>", "", text, flags=_re.DOTALL)
+        text = _re.sub(r"<[^>]+>", " ", text)
+        text = _re.sub(r"\s+", " ", text).strip()
+
+        file_id = _hashlib.md5(url.encode()).hexdigest()[:12]
+        # 取 domain 作為名稱
+        from urllib.parse import urlparse
+
+        domain = urlparse(url).netloc or url[:30]
+        name = f"{domain}"
+
+        _import_store[file_id] = {"name": name, "content": text[:50000]}
+
+        return {
+            "id": file_id,
+            "name": name,
+            "preview": text[:200] + ("..." if len(text) > 200 else ""),
+            "char_count": min(len(text), 50000),
+        }
+    except Exception as e:
+        return {"error": f"無法擷取該網址: {str(e)}"}

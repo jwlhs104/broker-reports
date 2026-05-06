@@ -15,6 +15,27 @@ const $convList = document.getElementById("conversation-list");
 const $newChatBtn = document.getElementById("new-chat-btn");
 const $sidebarBackdrop = document.getElementById("sidebar-backdrop");
 
+// ── Feature 1: Data source toggles ──
+const $toggleBroker = document.getElementById("toggle-broker");
+const $toggleFinancial = document.getElementById("toggle-financial");
+const $toggleEarnings = document.getElementById("toggle-earnings");
+const $toggleWeb = document.getElementById("toggle-web");
+
+// ── Feature 2: Import sources ──
+const $attachBtn = document.getElementById("attach-btn");
+const $attachMenu = document.getElementById("attach-menu");
+const $fileUpload = document.getElementById("file-upload");
+const $importedSources = document.getElementById("imported-sources");
+let sessionImports = []; // [{id, name, content, type}]
+
+// ── Feature 3: Related panel ──
+const $relatedPanel = document.getElementById("related-panel");
+const $toggleRelated = document.getElementById("toggle-related");
+const $relatedList = document.getElementById("related-list");
+const $closeRelated = document.getElementById("close-related");
+const $relatedBackdrop = document.getElementById("related-backdrop");
+let relatedReports = []; // 當前右側欄資料
+
 // ══════════════════════════════════════════════════════════
 //  Conversation State
 // ══════════════════════════════════════════════════════════
@@ -53,9 +74,22 @@ if ($sidebarBackdrop) $sidebarBackdrop.addEventListener("click", closeSidebarOnM
 const $sidebarClose = document.getElementById("sidebar-close");
 if ($sidebarClose) $sidebarClose.addEventListener("click", closeSidebarOnMobile);
 
+// ── Attach / Import listeners ──
+if ($attachBtn) $attachBtn.addEventListener("click", (e) => { e.stopPropagation(); toggleAttachMenu(); });
+if ($fileUpload) $fileUpload.addEventListener("change", handleFileUpload);
+
+// ── Related panel listeners ──
+if ($toggleRelated) $toggleRelated.addEventListener("click", toggleRelatedPanel);
+if ($closeRelated) $closeRelated.addEventListener("click", closeRelatedPanel);
+if ($relatedBackdrop) $relatedBackdrop.addEventListener("click", closeRelatedPanel);
+
 document.addEventListener("click", (e) => {
     if (!e.target.closest(".source-ref") && !e.target.closest(".source-chip") && !e.target.closest("#source-popover")) {
         hidePopover();
+    }
+    // 關閉 attach menu
+    if (!e.target.closest("#attach-btn") && !e.target.closest("#attach-menu")) {
+        if ($attachMenu) $attachMenu.classList.add("hidden");
     }
 });
 
@@ -480,6 +514,7 @@ async function sendMessage() {
     messageIndex++;
 
     let rawAnswer = "";
+    let externalSources = {}; // {financial: [...], earnings: [...], web: [...]}
     let sources = [];
 
     try {
@@ -490,6 +525,13 @@ async function sendMessage() {
                 question,
                 stock_code: $stockFilter.value.trim() || null,
                 history: historySnapshot,
+                data_sources: {
+                    broker_reports: $toggleBroker ? $toggleBroker.checked : true,
+                    financial_statements: $toggleFinancial ? $toggleFinancial.checked : false,
+                    earnings_presentations: $toggleEarnings ? $toggleEarnings.checked : false,
+                    web_search: $toggleWeb ? $toggleWeb.checked : false,
+                },
+                custom_context: sessionImports.map(s => ({ name: s.name, content: s.content })),
             }),
         });
 
@@ -530,6 +572,23 @@ async function sendMessage() {
                         } catch {}
                         break;
 
+                    case "related_hint":
+                        // 收到 related 提示，抓取右側欄資料
+                        try {
+                            const hint = JSON.parse(eventData);
+                            if (hint.stock_codes && hint.stock_codes.length > 0) {
+                                fetchRelatedReports(hint.stock_codes, hint.exclude_ids || []);
+                            }
+                        } catch {}
+                        break;
+
+                    case "external_sources":
+                        // 收到外部來源 metadata（財報、法說會、外網的 source URLs）
+                        try {
+                            externalSources = JSON.parse(eventData);
+                        } catch {}
+                        break;
+
                     case "chunk":
                         statusEl.style.display = "none";
                         rawAnswer += eventData;
@@ -556,6 +615,13 @@ async function sendMessage() {
 
         // ── 串流結束：最終渲染 ──
         statusEl.remove();
+
+        // ★ 清理 rawAnswer：移除殘留的 SOURCES_JSON 或裸 JSON sources
+        rawAnswer = rawAnswer.replace(/<!--SOURCES_JSON-->[\s\S]*?(<!--\/SOURCES_JSON-->|$)/g, "");
+        rawAnswer = rawAnswer.replace(/\n*\[\s*\n?\s*\{[^]*?"report_id"\s*:[^]*$/gm, function(m) {
+            return (/"report_id"/.test(m) && (/"excerpt"/.test(m) || /"id"/.test(m))) ? "" : m;
+        });
+        rawAnswer = rawAnswer.trim();
 
         // ★ 存到正確的對話
         const targetConv = getConv(sendConvId);
@@ -592,6 +658,54 @@ async function sendMessage() {
                     </span>
                 `).join("");
                 contentEl.appendChild(sourcesBar);
+            }
+
+            // 渲染外部來源連結區塊
+            if (Object.keys(externalSources).length > 0) {
+                const extBar = document.createElement("div");
+                extBar.className = "external-sources-bar";
+                let extHtml = "";
+
+                const sectionConfig = {
+                    financial: { icon: "📊", label: "財報來源" },
+                    earnings:  { icon: "🎤", label: "法說會來源" },
+                    web:       { icon: "🌐", label: "外部資料來源" },
+                };
+
+                for (const [key, items] of Object.entries(externalSources)) {
+                    if (!items || items.length === 0) continue;
+                    const cfg = sectionConfig[key] || { icon: "📎", label: key };
+                    const links = items.flatMap(item =>
+                        (item.sources || []).map(src => {
+                            // 解析「名稱 | URL」或「名稱 - URL」或純 URL
+                            const parts = src.split(/\s*[\|]\s*/);
+                            if (parts.length >= 2 && parts[1].startsWith("http")) {
+                                return `<a href="${escapeHtml(parts[1])}" target="_blank" rel="noopener">${escapeHtml(parts[0])}</a>`;
+                            }
+                            const dashParts = src.split(/\s*-\s*(?=http)/);
+                            if (dashParts.length >= 2 && dashParts[1].startsWith("http")) {
+                                return `<a href="${escapeHtml(dashParts[1])}" target="_blank" rel="noopener">${escapeHtml(dashParts[0])}</a>`;
+                            }
+                            if (src.startsWith("http")) {
+                                const domain = new URL(src).hostname.replace("www.", "");
+                                return `<a href="${escapeHtml(src)}" target="_blank" rel="noopener">${escapeHtml(domain)}</a>`;
+                            }
+                            return `<span>${escapeHtml(src)}</span>`;
+                        })
+                    );
+                    if (links.length > 0) {
+                        extHtml += `
+                            <div class="ext-source-section">
+                                <span class="ext-source-label">${cfg.icon} ${cfg.label}</span>
+                                <div class="ext-source-links">${links.join("")}</div>
+                            </div>`;
+                    }
+                }
+
+                if (extHtml) {
+                    extBar.innerHTML = extHtml;
+                    contentEl.appendChild(extBar);
+                }
             }
 
             chatHistory.push({ role: "assistant", content: rawAnswer });
@@ -641,6 +755,21 @@ function processSourceRefs(text, msgIdx) {
     if (!text) return "";
 
     try {
+        // ── 清除殘留的 SOURCES_JSON 區塊 ──
+        text = text.replace(/<!--SOURCES_JSON-->[\s\S]*?(<!--\/SOURCES_JSON-->|$)/g, "");
+
+        // ── 清除 LLM 直接輸出的裸 JSON sources array ──
+        // 匹配文末的 JSON array（以 [ 開頭且包含 "report_id" 的大段 JSON）
+        text = text.replace(/\n*\[\s*\n?\s*\{[^]*?"report_id"\s*:[^]*$/gm, function(match) {
+            // 只在它看起來像 sources array 時才移除（含 report_id + excerpt）
+            if (/"report_id"/.test(match) && (/"excerpt"/.test(match) || /"id"/.test(match))) {
+                return "";
+            }
+            return match;
+        });
+
+        text = text.trim();
+
         const placeholders = {};
         let safe = text.replace(/\[(\d+)\]/g, (match, num) => {
             const key = `%%SRC_${num}%%`;
@@ -1108,3 +1237,209 @@ window._debugConversations = function() {
         })));
     }
 };
+
+// ══════════════════════════════════════════════════════════
+//  Feature 1: Data Source Toggles (UI only, logic in sendMessage)
+// ══════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════
+//  Feature 2: Import Custom Data Sources
+// ══════════════════════════════════════════════════════════
+function toggleAttachMenu() {
+    if (!$attachMenu) return;
+    $attachMenu.classList.toggle("hidden");
+    // 定位在 attach button 上方
+    if (!$attachMenu.classList.contains("hidden")) {
+        const rect = $attachBtn.getBoundingClientRect();
+        $attachMenu.style.bottom = (window.innerHeight - rect.top + 8) + "px";
+        $attachMenu.style.left = rect.left + "px";
+    }
+}
+
+function triggerFileUpload() {
+    if ($attachMenu) $attachMenu.classList.add("hidden");
+    if ($fileUpload) $fileUpload.click();
+}
+
+async function handleFileUpload(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+        const res = await fetch("/api/import/file", { method: "POST", body: formData });
+        const data = await res.json();
+        if (data.error) { alert("匯入失敗: " + data.error); return; }
+
+        // 從 _import_store 取得完整內容（透過 preview 先顯示）
+        sessionImports.push({
+            id: data.id,
+            name: data.name,
+            content: data.preview, // 先用 preview，之後可改完整
+            type: "file",
+            charCount: data.char_count,
+        });
+        renderImportedSources();
+    } catch (err) {
+        alert("上傳失敗: " + err.message);
+    }
+
+    // 重置 file input
+    if ($fileUpload) $fileUpload.value = "";
+}
+
+function promptUrlImport() {
+    if ($attachMenu) $attachMenu.classList.add("hidden");
+    const url = prompt("請輸入網址：");
+    if (!url || !url.trim()) return;
+    importUrl(url.trim());
+}
+
+async function importUrl(url) {
+    try {
+        const res = await fetch("/api/import/url", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ url }),
+        });
+        const data = await res.json();
+        if (data.error) { alert("匯入失敗: " + data.error); return; }
+
+        sessionImports.push({
+            id: data.id,
+            name: data.name,
+            content: data.preview,
+            type: "url",
+            charCount: data.char_count,
+        });
+        renderImportedSources();
+    } catch (err) {
+        alert("匯入失敗: " + err.message);
+    }
+}
+
+function renderImportedSources() {
+    if (!$importedSources) return;
+    if (sessionImports.length === 0) {
+        $importedSources.innerHTML = "";
+        return;
+    }
+    $importedSources.innerHTML = sessionImports.map((s, i) => `
+        <div class="import-chip" data-idx="${i}">
+            <span class="import-chip-icon">${s.type === "file" ? "📄" : "🔗"}</span>
+            <span class="import-chip-name">${escapeHtml(s.name)}</span>
+            <span class="import-chip-size">${(s.charCount / 1000).toFixed(1)}k</span>
+            <button class="import-chip-remove" onclick="removeImport(${i})" title="移除">&times;</button>
+        </div>
+    `).join("");
+}
+
+function removeImport(idx) {
+    sessionImports.splice(idx, 1);
+    renderImportedSources();
+}
+
+// ══════════════════════════════════════════════════════════
+//  Feature 3: Related Reports Panel
+// ══════════════════════════════════════════════════════════
+function toggleRelatedPanel() {
+    if (!$relatedPanel) return;
+    const isCollapsed = $relatedPanel.classList.contains("collapsed");
+    if (isCollapsed) {
+        $relatedPanel.classList.remove("collapsed");
+        if ($toggleRelated) $toggleRelated.classList.add("active-icon");
+        if (isMobile() && $relatedBackdrop) $relatedBackdrop.classList.add("active");
+    } else {
+        closeRelatedPanel();
+    }
+}
+
+function closeRelatedPanel() {
+    if ($relatedPanel) $relatedPanel.classList.add("collapsed");
+    if ($toggleRelated) $toggleRelated.classList.remove("active-icon");
+    if ($relatedBackdrop) $relatedBackdrop.classList.remove("active");
+}
+
+async function fetchRelatedReports(stockCodes, excludeIds) {
+    try {
+        const params = new URLSearchParams({
+            stock_codes: stockCodes.join(","),
+            exclude_ids: excludeIds.join(","),
+            limit: "15",
+        });
+        const res = await fetch(`/api/related?${params}`);
+        relatedReports = await res.json();
+        renderRelatedReports("relevance");
+
+        // 自動展開右側欄（如果有結果且非手機）
+        if (relatedReports.length > 0 && !isMobile()) {
+            $relatedPanel.classList.remove("collapsed");
+            if ($toggleRelated) $toggleRelated.classList.add("active-icon");
+        }
+    } catch (err) {
+        console.error("[ANALYST] Failed to fetch related reports:", err);
+    }
+}
+
+function sortRelated(sortBy, btn) {
+    // Update active tab
+    document.querySelectorAll(".related-sort").forEach(b => b.classList.remove("active"));
+    if (btn) btn.classList.add("active");
+    renderRelatedReports(sortBy);
+}
+
+function renderRelatedReports(sortBy) {
+    if (!$relatedList) return;
+
+    if (relatedReports.length === 0) {
+        $relatedList.innerHTML = `<div class="related-empty">送出問題後，這裡會顯示相關報告</div>`;
+        return;
+    }
+
+    let sorted = [...relatedReports];
+    switch (sortBy) {
+        case "relevance":
+            sorted.sort((a, b) => b.relevance_score - a.relevance_score);
+            break;
+        case "pages":
+            sorted.sort((a, b) => (b.page_count || 0) - (a.page_count || 0));
+            break;
+        case "first-coverage":
+            sorted = sorted.filter(r => r.is_first_coverage);
+            if (sorted.length === 0) {
+                $relatedList.innerHTML = `<div class="related-empty">此搜尋結果中沒有初次覆蓋的報告</div>`;
+                return;
+            }
+            break;
+    }
+
+    $relatedList.innerHTML = sorted.map(r => {
+        const tags = (r.tags || []).map(t => {
+            let cls = "related-tag";
+            if (t === "關聯高") cls += " tag-relevance";
+            else if (t === "頁數多") cls += " tag-pages";
+            else if (t === "初次覆蓋") cls += " tag-first";
+            return `<span class="${cls}">${t}</span>`;
+        }).join("");
+
+        const ratingCls = r.rating === "買進" ? "buy" : r.rating === "賣出" ? "sell" : "hold";
+
+        return `
+        <div class="related-card" onclick="showReportModal(${r.id})">
+            <div class="related-card-header">
+                <span class="related-stock">${escapeHtml(r.stock_code)} ${escapeHtml(r.stock_name)}</span>
+                ${r.rating ? `<span class="related-rating ${ratingCls}">${escapeHtml(r.rating)}</span>` : ""}
+            </div>
+            <div class="related-card-meta">
+                <span class="related-broker">${escapeHtml(r.broker)}</span>
+                <span class="related-date">${escapeHtml(r.date)}</span>
+                ${r.page_count ? `<span class="related-pages">${r.page_count}p</span>` : ""}
+            </div>
+            ${r.target_price ? `<div class="related-tp">TP $${r.target_price.toLocaleString()}</div>` : ""}
+            ${tags ? `<div class="related-tags">${tags}</div>` : ""}
+            ${r.summary ? `<div class="related-summary">${escapeHtml(r.summary)}</div>` : ""}
+        </div>`;
+    }).join("");
+}
